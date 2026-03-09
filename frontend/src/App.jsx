@@ -3,6 +3,7 @@ import { useDropzone } from 'react-dropzone'
 import EnhancedScenario1Tab from './EnhancedScenario1Tab'
 import EndpointsTab from './EndpointsTab'
 import Dashboard from './Dashboard'
+import EmailReportsTab from './EmailReportsTab'
 
 const API_BASE = 'http://localhost:8000'
 
@@ -320,6 +321,16 @@ function App() {
               >
                 Dashboard
               </button>
+              <button
+                onClick={() => setActiveTab('email')}
+                className={`px-6 py-3 text-sm font-medium ${
+                  activeTab === 'email'
+                    ? 'border-b-2 border-blue-500 text-blue-600'
+                    : 'text-gray-500 hover:text-gray-700'
+                }`}
+              >
+                Email Reports
+              </button>
             </nav>
           </div>
 
@@ -566,6 +577,10 @@ function App() {
 
             {activeTab === 'dashboard' && (
               <Dashboard />
+            )}
+
+            {activeTab === 'email' && (
+              <EmailReportsTab />
             )}
           </div>
         </div>
