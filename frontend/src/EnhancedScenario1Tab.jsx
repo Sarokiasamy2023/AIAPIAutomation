@@ -304,6 +304,19 @@ function EnhancedScenario1Tab({ mappingId }) {
   // Endpoint filter state
   const [filterEndpointId, setFilterEndpointId] = useState('')
   
+  // Custom Business Rules State
+  const [showBusinessRules, setShowBusinessRules] = useState(false)
+  const [businessRules, setBusinessRules] = useState([])
+  
+  // Pagination state for scenario results
+  const [currentPage, setCurrentPage] = useState({}) // Track page per scenario ID
+  const RESULTS_PER_PAGE = 10
+  const [newRuleName, setNewRuleName] = useState('')
+  const [newRuleText, setNewRuleText] = useState('')
+  const [businessRuleResults, setBusinessRuleResults] = useState(null)
+  const [loadingBusinessRules, setLoadingBusinessRules] = useState(false)
+  const [runningBusinessRules, setRunningBusinessRules] = useState(false)
+  
   // AI Root Cause Analysis State
   const [rootCauseData, setRootCauseData] = useState({})
   const [loadingAnalysis, setLoadingAnalysis] = useState({})
@@ -314,7 +327,7 @@ function EnhancedScenario1Tab({ mappingId }) {
   useEffect(() => {
     fetchScenarios()
     fetchEndpoints()
-  }, [mappingId])
+  }, [mappingId, filterEndpointId])
 
   const fetchScenarios = async () => {
     try {
@@ -421,13 +434,23 @@ function EnhancedScenario1Tab({ mappingId }) {
   }
 
   const exportToExcel = async () => {
-    if (!mappingId) {
-      alert('No mapping selected')
-      return
-    }
-
     try {
-      const response = await fetch(`${API_BASE}/api/mappings/${mappingId}/scenarios/export`)
+      // Build URL with filter parameters
+      let url = `${API_BASE}/api/scenarios/export-excel`
+      const params = new URLSearchParams()
+      
+      if (filterEndpointId) {
+        params.append('endpoint_id', filterEndpointId)
+      } else if (mappingId) {
+        params.append('mapping_id', mappingId)
+      }
+      // If no filters, exports all scenarios
+      
+      if (params.toString()) {
+        url += `?${params.toString()}`
+      }
+      
+      const response = await fetch(url)
       
       if (response.ok) {
         const blob = await response.blob()
@@ -745,6 +768,131 @@ function EnhancedScenario1Tab({ mappingId }) {
     }
   }
 
+  const fetchBusinessRules = async (endpointId) => {
+    if (!endpointId) return
+    
+    setLoadingBusinessRules(true)
+    try {
+      const response = await fetch(`${API_BASE}/api/business-rules/endpoint/${endpointId}`)
+      const data = await response.json()
+      setBusinessRules(data)
+    } catch (error) {
+      console.error('Error fetching business rules:', error)
+    } finally {
+      setLoadingBusinessRules(false)
+    }
+  }
+
+  const saveBusinessRule = async () => {
+    if (!newRuleName || !newRuleText) {
+      alert('Please enter both rule name and rule text')
+      return
+    }
+    
+    if (!filterEndpointId) {
+      alert('Please select an endpoint first')
+      return
+    }
+    
+    try {
+      const response = await fetch(`${API_BASE}/api/business-rules`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          endpoint_id: parseInt(filterEndpointId),
+          rule_name: newRuleName,
+          rule_text: newRuleText
+        })
+      })
+      
+      if (response.ok) {
+        alert('Business rule saved successfully!')
+        setNewRuleName('')
+        setNewRuleText('')
+        fetchBusinessRules(filterEndpointId)
+        fetchScenarios()  // Refresh scenarios to show the new business rule scenario
+      } else {
+        alert('Failed to save business rule')
+      }
+    } catch (error) {
+      console.error('Error saving business rule:', error)
+      alert('Error saving business rule')
+    }
+  }
+
+  const deleteBusinessRule = async (ruleId) => {
+    if (!confirm('Are you sure you want to delete this rule?')) return
+    
+    try {
+      const response = await fetch(`${API_BASE}/api/business-rules/${ruleId}`, {
+        method: 'DELETE'
+      })
+      
+      if (response.ok) {
+        alert('Rule deleted successfully')
+        fetchBusinessRules(filterEndpointId)
+        fetchScenarios()  // Refresh scenarios to remove the deleted business rule scenario
+      } else {
+        alert('Failed to delete rule')
+      }
+    } catch (error) {
+      console.error('Error deleting rule:', error)
+      alert('Error deleting rule')
+    }
+  }
+
+  const runBusinessRuleValidation = async () => {
+    if (!filterEndpointId) {
+      alert('Please select an endpoint first')
+      return
+    }
+    
+    setRunningBusinessRules(true)
+    setBusinessRuleResults(null)
+    
+    try {
+      const response = await fetch(`${API_BASE}/api/business-rules/validate/${filterEndpointId}`, {
+        method: 'POST'
+      })
+      
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => ({ detail: 'Unknown error' }))
+        console.error('Validation failed:', errorData)
+        alert(`Validation failed: ${errorData.detail || 'Unknown error'}`)
+        setRunningBusinessRules(false)
+        return
+      }
+      
+      const data = await response.json()
+      console.log('Validation results:', data)
+      
+      // Validate response structure
+      if (!data.summary || !data.results) {
+        console.error('Invalid response structure:', data)
+        alert('Invalid response from server. Check console for details.')
+        setRunningBusinessRules(false)
+        return
+      }
+      
+      setBusinessRuleResults(data)
+    } catch (error) {
+      console.error('Error running business rule validation:', error)
+      alert(`Error running validation: ${error.message}`)
+    } finally {
+      setRunningBusinessRules(false)
+    }
+  }
+
+  const openBusinessRulesPanel = () => {
+    if (!filterEndpointId) {
+      alert('Please select an endpoint first to manage business rules')
+      return
+    }
+    
+    setShowBusinessRules(true)
+    fetchBusinessRules(filterEndpointId)
+  }
+
   const validateExcelData = async () => {
     if (!excelFile) {
       alert('Please select an Excel file')
@@ -904,9 +1052,18 @@ function EnhancedScenario1Tab({ mappingId }) {
           ))}
         </select>
         {filterEndpointId && (
-          <span className="text-sm text-gray-600">
-            Showing {filteredScenarios.length} of {scenarios.length} scenarios
-          </span>
+          <>
+            <span className="text-sm text-gray-600">
+              Showing {filteredScenarios.length} of {scenarios.length} scenarios
+            </span>
+            <button
+              onClick={openBusinessRulesPanel}
+              className="px-4 py-2 bg-indigo-600 text-white rounded-md hover:bg-indigo-700 flex items-center gap-2"
+            >
+              <span>📋</span>
+              Custom Business Scenario Validations
+            </button>
+          </>
         )}
       </div>
 
@@ -946,40 +1103,36 @@ function EnhancedScenario1Tab({ mappingId }) {
                       )}
                     </div>
                     <div className="flex gap-2">
-                      <button
-                        onClick={() => openRequestBuilder(scenario)}
-                        className="px-3 py-1 text-sm bg-purple-600 text-white rounded hover:bg-purple-700"
-                      >
-                        Configure
-                      </button>
-                      <button
-                        onClick={() => fetchExecutionHistory(scenario.id)}
-                        className="px-3 py-1 text-sm bg-gray-600 text-white rounded hover:bg-gray-700"
-                      >
-                        History
-                      </button>
-                      <button
-                        onClick={() => confirmDeleteScenario(scenario)}
-                        className="px-3 py-1 text-sm bg-red-600 text-white rounded hover:bg-red-700"
-                        title="Delete this scenario"
-                      >
-                        Delete
-                      </button>
-                      <button
-                        onClick={() => runSchemaValidation(scenario.id)}
-                        disabled={isRunning}
-                        className="px-4 py-2 bg-purple-600 text-white rounded-md hover:bg-purple-700 disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2"
-                        title="Schema-only validation (structure and field presence)"
-                      >
-                        {isRunning ? (
-                          <>
-                            <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-white"></div>
-                            Checking...
-                          </>
-                        ) : (
-                          'Schema Check'
-                        )}
-                      </button>
+                      {/* Only show Configure for non-business-rule scenarios */}
+                      {scenario.category !== 'business_rule' && (
+                        <button
+                          onClick={() => openRequestBuilder(scenario)}
+                          className="px-3 py-1 text-sm bg-purple-600 text-white rounded hover:bg-purple-700"
+                        >
+                          Configure
+                        </button>
+                      )}
+                      
+                      {/* Only show Schema Check for schema validation scenarios */}
+                      {(scenario.name && (scenario.name.toLowerCase().includes('schema') || scenario.category === 'schema')) && (
+                        <button
+                          onClick={() => runSchemaValidation(scenario.id)}
+                          disabled={isRunning}
+                          className="px-4 py-2 bg-purple-600 text-white rounded-md hover:bg-purple-700 disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2"
+                          title="Schema-only validation (structure and field presence)"
+                        >
+                          {isRunning ? (
+                            <>
+                              <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-white"></div>
+                              Checking...
+                            </>
+                          ) : (
+                            'Schema Check'
+                          )}
+                        </button>
+                      )}
+                      
+                      {/* Run button - always visible */}
                       <button
                         onClick={() => runScenario(scenario.id)}
                         disabled={isRunning}
@@ -993,6 +1146,23 @@ function EnhancedScenario1Tab({ mappingId }) {
                         ) : (
                           'Run'
                         )}
+                      </button>
+                      
+                      {/* Delete button - always visible */}
+                      <button
+                        onClick={() => confirmDeleteScenario(scenario)}
+                        className="px-3 py-1 text-sm bg-red-600 text-white rounded hover:bg-red-700"
+                        title="Delete this scenario"
+                      >
+                        Delete
+                      </button>
+                      
+                      {/* History button - always visible */}
+                      <button
+                        onClick={() => fetchExecutionHistory(scenario.id)}
+                        className="px-3 py-1 text-sm bg-gray-600 text-white rounded hover:bg-gray-700"
+                      >
+                        History
                       </button>
                     </div>
                   </div>
@@ -1322,60 +1492,65 @@ function EnhancedScenario1Tab({ mappingId }) {
                       </div>
                     </div>
 
-                    <div className="overflow-x-auto">
-                      <table className="min-w-full divide-y divide-gray-200">
+                    <div>
+                      <table className="w-full divide-y divide-gray-200 table-fixed">
                         <thead className="bg-gray-50">
                           <tr>
-                            <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Field</th>
-                            <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Type</th>
-                            <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Expected</th>
-                            <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Actual</th>
-                            <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Value</th>
-                            <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase">Status</th>
+                            <th className="px-3 py-2 text-left text-xs font-medium text-gray-500 uppercase w-1/6">Field</th>
+                            <th className="px-2 py-2 text-left text-xs font-medium text-gray-500 uppercase w-1/12">Type</th>
+                            <th className="px-2 py-2 text-left text-xs font-medium text-gray-500 uppercase w-1/6">Expected</th>
+                            <th className="px-2 py-2 text-left text-xs font-medium text-gray-500 uppercase w-1/6">Actual</th>
+                            <th className="px-2 py-2 text-left text-xs font-medium text-gray-500 uppercase w-1/6">Value</th>
+                            <th className="px-2 py-2 text-left text-xs font-medium text-gray-500 uppercase w-1/12">Status</th>
                           </tr>
                         </thead>
                         <tbody className="bg-white divide-y divide-gray-200">
-                          {scenarioResults.results.map((result, idx) => (
+                          {(() => {
+                            const page = currentPage[scenario.id] || 1
+                            const startIdx = (page - 1) * RESULTS_PER_PAGE
+                            const endIdx = startIdx + RESULTS_PER_PAGE
+                            const paginatedResults = scenarioResults.results.slice(startIdx, endIdx)
+                            return paginatedResults.map((result, idx) => (
                             <React.Fragment key={`${scenario.id}-${result.field_name}-${idx}`}>
                               <tr>
-                                <td className="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900">
+                                <td className="px-3 py-2 text-sm font-medium text-gray-900 truncate">
                                   {result.field_name}
                                 </td>
-                                <td className="px-6 py-4 whitespace-nowrap text-xs">
-                                  <span className="px-2 py-1 bg-gray-100 text-gray-700 rounded">
+                                <td className="px-2 py-2 text-xs">
+                                  <span className="px-1 py-0.5 bg-gray-100 text-gray-700 rounded text-xs">
                                     {result.validation_type || 'FIELD'}
                                   </span>
                                 </td>
-                                <td className="px-6 py-4 text-sm text-gray-700 max-w-xs truncate">
+                                <td className="px-2 py-2 text-xs text-gray-700 truncate">
                                   {result.expected}
                                 </td>
-                                <td className="px-6 py-4 text-sm text-gray-700 max-w-xs">
+                                <td className="px-2 py-2 text-xs text-gray-700 truncate">
                                   {result.field_name === 'JSON_SCHEMA' && result.actual ? (
-                                    <div className="font-mono text-xs bg-gray-50 px-2 py-1 rounded max-h-24 overflow-y-auto">
+                                    <div className="font-mono text-xs bg-gray-50 px-1 py-0.5 rounded max-h-16 overflow-y-auto">
                                       <pre className="whitespace-pre-wrap">
                                         {typeof result.actual === 'string' && result.actual.startsWith('{') 
-                                          ? JSON.stringify(JSON.parse(result.actual), null, 2).substring(0, 200) + '...'
-                                          : String(result.actual).substring(0, 200)
+                                          ? JSON.stringify(JSON.parse(result.actual), null, 2).substring(0, 100) + '...'
+                                          : String(result.actual).substring(0, 100)
                                         }
                                       </pre>
                                     </div>
                                   ) : (
-                                    <span className="truncate">{result.actual}</span>
+                                    <span className="truncate block">{result.actual}</span>
                                   )}
                                 </td>
-                                <td className="px-6 py-4 text-sm text-gray-900 max-w-xs truncate" title={result.actual_value || 'N/A'}>
+                                <td className="px-2 py-2 text-xs text-gray-900 truncate" title={result.actual_value || 'N/A'}>
                                   {result.actual_value ? (
-                                    <span className="font-mono text-xs bg-gray-50 px-2 py-1 rounded">
+                                    <span className="font-mono text-xs bg-gray-50 px-1 py-0.5 rounded block truncate">
                                       {typeof result.actual_value === 'object' 
-                                        ? JSON.stringify(result.actual_value).substring(0, 50) + '...'
-                                        : String(result.actual_value).substring(0, 50)
+                                        ? JSON.stringify(result.actual_value).substring(0, 30) + '...'
+                                        : String(result.actual_value).substring(0, 30)
                                       }
                                     </span>
                                   ) : (
                                     <span className="text-gray-400 italic">N/A</span>
                                   )}
                                 </td>
-                                <td className="px-6 py-4 whitespace-nowrap">
+                                <td className="px-2 py-2">
                                   <span
                                     className={`px-2 py-1 text-xs font-medium rounded-full ${
                                       result.status === 'pass'
@@ -1398,10 +1573,28 @@ function EnhancedScenario1Tab({ mappingId }) {
                                 </td>
                               </tr>
                               
+                              {/* Record Data Display - Show for all results with record_data */}
+                              {result.record_data && (
+                                <tr key={`${idx}-record`}>
+                                  <td colSpan="6" className="px-0 py-0 bg-gray-50">
+                                    <div className="flex border-l-4 border-blue-400">
+                                      <div className="flex-shrink-0 px-4 py-3 bg-blue-50 border-r-2 border-blue-300" style={{minWidth: '120px'}}>
+                                        <span className="text-xs font-semibold text-blue-700 uppercase block">Record #{result.record_number || idx + 1}</span>
+                                      </div>
+                                      <div className="flex-1 px-4 py-3">
+                                        <pre className="text-xs font-mono bg-white p-2 rounded border border-gray-200 overflow-x-auto" style={{maxHeight: '120px', overflowY: 'auto', lineHeight: '1.3'}}>
+                                          {JSON.stringify(result.record_data, null, 2)}
+                                        </pre>
+                                      </div>
+                                    </div>
+                                  </td>
+                                </tr>
+                              )}
+                              
                               {/* Error Details Display for Failed Fields */}
                               {result.status === 'fail' && (
                                 <tr key={`${idx}-rootcause`}>
-                                  <td colSpan="5" className="px-6 py-3 bg-red-50 border-l-4 border-red-400">
+                                  <td colSpan="6" className="px-6 py-3 bg-red-50 border-l-4 border-red-400">
                                     <div className="flex items-start gap-3">
                                       <div className="flex-shrink-0">
                                         <div className="w-2 h-2 bg-red-400 rounded-full mt-2"></div>
@@ -1464,10 +1657,39 @@ function EnhancedScenario1Tab({ mappingId }) {
                                 </tr>
                               )}
                             </React.Fragment>
-                          ))}
+                          ))
+                          })()}
                         </tbody>
                       </table>
                     </div>
+                    
+                    {/* Pagination Controls */}
+                    {scenarioResults.results && scenarioResults.results.length > RESULTS_PER_PAGE && (
+                      <div className="flex items-center justify-between px-6 py-4 border-t border-gray-200 bg-gray-50">
+                        <div className="text-sm text-gray-700">
+                          Showing {((currentPage[scenario.id] || 1) - 1) * RESULTS_PER_PAGE + 1} to {Math.min((currentPage[scenario.id] || 1) * RESULTS_PER_PAGE, scenarioResults.results.length)} of {scenarioResults.results.length} results
+                        </div>
+                        <div className="flex gap-2">
+                          <button
+                            onClick={() => setCurrentPage({...currentPage, [scenario.id]: (currentPage[scenario.id] || 1) - 1})}
+                            disabled={(currentPage[scenario.id] || 1) === 1}
+                            className="px-3 py-1 text-sm bg-white border border-gray-300 rounded hover:bg-gray-50 disabled:opacity-50 disabled:cursor-not-allowed"
+                          >
+                            Previous
+                          </button>
+                          <span className="px-3 py-1 text-sm text-gray-700">
+                            Page {currentPage[scenario.id] || 1} of {Math.ceil(scenarioResults.results.length / RESULTS_PER_PAGE)}
+                          </span>
+                          <button
+                            onClick={() => setCurrentPage({...currentPage, [scenario.id]: (currentPage[scenario.id] || 1) + 1})}
+                            disabled={(currentPage[scenario.id] || 1) >= Math.ceil(scenarioResults.results.length / RESULTS_PER_PAGE)}
+                            className="px-3 py-1 text-sm bg-white border border-gray-300 rounded hover:bg-gray-50 disabled:opacity-50 disabled:cursor-not-allowed"
+                          >
+                            Next
+                          </button>
+                        </div>
+                      </div>
+                    )}
                   </div>
                 )}
               </div>
@@ -2019,6 +2241,217 @@ function EnhancedScenario1Tab({ mappingId }) {
           </div>
         </div>
       )}
+      {/* Custom Business Scenario Validations Modal */}
+      {showBusinessRules && (
+        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4">
+          <div className="bg-white rounded-lg shadow-xl max-w-6xl w-full max-h-[90vh] overflow-y-auto">
+            <div className="sticky top-0 bg-white border-b border-gray-200 px-6 py-4 flex justify-between items-center">
+              <h2 className="text-2xl font-bold text-gray-900">Custom Business Scenario Validations</h2>
+              <button
+                onClick={() => {
+                  setShowBusinessRules(false)
+                  setBusinessRuleResults(null)
+                }}
+                className="text-gray-400 hover:text-gray-600"
+              >
+                <span className="text-2xl">×</span>
+              </button>
+            </div>
+
+            <div className="p-6 space-y-6">
+              {/* Rule Editor Section */}
+              <div className="bg-gray-50 rounded-lg p-6 border border-gray-200">
+                <h3 className="text-lg font-semibold text-gray-900 mb-4">Create New Validation Rule</h3>
+                <p className="text-sm text-gray-600 mb-4">
+                  Write validation rules in natural language. The AI will interpret and execute them.
+                </p>
+                
+                <div className="space-y-4">
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-2">Rule Name</label>
+                    <input
+                      type="text"
+                      value={newRuleName}
+                      onChange={(e) => setNewRuleName(e.target.value)}
+                      placeholder="e.g., HRSA Flag Validation"
+                      className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                    />
+                  </div>
+                  
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-2">Rule Text (Natural Language)</label>
+                    <textarea
+                      value={newRuleText}
+                      onChange={(e) => setNewRuleText(e.target.value)}
+                      placeholder="Examples:&#10;- If title starts with HRSA- then hrsaWideFlag must be Y&#10;- trackingTypeCode must be one of: Term, Condition, Reporting Requirement&#10;- activeDate should not be later than lastUpdateDate&#10;- If programType is null then inactiveDate must also be null"
+                      rows={6}
+                      className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-indigo-500 font-mono text-sm"
+                    />
+                  </div>
+                  
+                  <button
+                    onClick={saveBusinessRule}
+                    className="px-4 py-2 bg-indigo-600 text-white rounded-md hover:bg-indigo-700"
+                  >
+                    Save Rule
+                  </button>
+                </div>
+              </div>
+
+              {/* Saved Rules Section */}
+              <div className="bg-white rounded-lg border border-gray-200">
+                <div className="px-6 py-4 border-b border-gray-200 flex justify-between items-center">
+                  <h3 className="text-lg font-semibold text-gray-900">Saved Custom Business Scenarios</h3>
+                  <button
+                    onClick={runBusinessRuleValidation}
+                    disabled={runningBusinessRules || businessRules.length === 0}
+                    className="px-4 py-2 bg-green-600 text-white rounded-md hover:bg-green-700 disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2"
+                  >
+                    {runningBusinessRules ? (
+                      <>
+                        <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-white"></div>
+                        Running Validation...
+                      </>
+                    ) : (
+                      <>
+                        <span>▶</span>
+                        Run Business Scenarios
+                      </>
+                    )}
+                  </button>
+                </div>
+                
+                <div className="p-6">
+                  {loadingBusinessRules ? (
+                    <div className="text-center py-8">
+                      <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-indigo-600 mx-auto"></div>
+                      <p className="text-gray-500 mt-2">Loading rules...</p>
+                    </div>
+                  ) : businessRules.length === 0 ? (
+                    <div className="text-center py-8 text-gray-500">
+                      No rules created yet. Create your first validation rule above.
+                    </div>
+                  ) : (
+                    <div className="space-y-3">
+                      {businessRules.map((rule) => (
+                        <div key={rule.id} className="border border-gray-200 rounded-lg p-4 hover:bg-gray-50">
+                          <div className="flex justify-between items-start">
+                            <div className="flex-1">
+                              <h4 className="font-semibold text-gray-900">{rule.rule_name}</h4>
+                              <p className="text-sm text-gray-600 mt-1 font-mono bg-gray-100 p-2 rounded">
+                                {rule.rule_text}
+                              </p>
+                              <p className="text-xs text-gray-400 mt-2">
+                                Created: {new Date(rule.created_date).toLocaleString()}
+                              </p>
+                            </div>
+                            <button
+                              onClick={() => deleteBusinessRule(rule.id)}
+                              className="ml-4 text-red-600 hover:text-red-800"
+                            >
+                              🗑️
+                            </button>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              {/* Validation Results Section */}
+              {businessRuleResults && businessRuleResults.summary && businessRuleResults.results && (
+                <div className="bg-white rounded-lg border border-gray-200">
+                  <div className="px-6 py-4 border-b border-gray-200">
+                    <h3 className="text-lg font-semibold text-gray-900">Validation Results</h3>
+                    <div className="mt-2 flex gap-4 text-sm">
+                      <span className="text-gray-600">
+                        Total Validations: <strong>{businessRuleResults.summary.total_validations || 0}</strong>
+                      </span>
+                      <span className="text-green-600">
+                        Passed: <strong>{businessRuleResults.summary.passed || 0}</strong>
+                      </span>
+                      <span className="text-red-600">
+                        Failed: <strong>{businessRuleResults.summary.failed || 0}</strong>
+                      </span>
+                      <span className="text-gray-600">
+                        Records: <strong>{businessRuleResults.summary.total_records || 0}</strong>
+                      </span>
+                      <span className="text-gray-600">
+                        Rules: <strong>{businessRuleResults.summary.total_rules || 0}</strong>
+                      </span>
+                    </div>
+                  </div>
+                  
+                  <div className="p-6 overflow-x-auto">
+                    <table className="min-w-full divide-y divide-gray-200">
+                      <thead className="bg-gray-50">
+                        <tr>
+                          <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Rule</th>
+                          <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Record #</th>
+                          <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Field</th>
+                          <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Expected</th>
+                          <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Actual</th>
+                          <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Result</th>
+                          <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Error Message</th>
+                        </tr>
+                      </thead>
+                      <tbody className="bg-white divide-y divide-gray-200">
+                        {businessRuleResults.results && businessRuleResults.results.map((result, idx) => (
+                          <tr key={idx} className={result.result === 'FAIL' ? 'bg-red-50' : ''}>
+                            <td className="px-4 py-3 text-sm">
+                              <div className="font-medium text-gray-900">{result.rule_name}</div>
+                              <div className="text-xs text-gray-500 font-mono">{result.rule_text}</div>
+                              {result.warnings && result.warnings.length > 0 && (
+                                <div className="text-xs text-orange-600 mt-1">
+                                  {result.warnings.map((w, i) => <div key={i}>⚠️ {w}</div>)}
+                                </div>
+                              )}
+                            </td>
+                            <td className="px-4 py-3 text-sm text-gray-900">{result.record_number}</td>
+                            <td className="px-4 py-3 text-sm text-gray-900 font-mono">{result.field_name}</td>
+                            <td className="px-4 py-3 text-sm text-gray-600">{result.expected_value || '-'}</td>
+                            <td className="px-4 py-3 text-sm text-gray-600">{result.actual_value || '-'}</td>
+                            <td className="px-4 py-3 text-sm">
+                              <span className={`px-2 py-1 text-xs font-semibold rounded-full ${
+                                result.result === 'PASS' 
+                                  ? 'bg-green-100 text-green-800' 
+                                  : 'bg-red-100 text-red-800'
+                              }`}>
+                                {result.result}
+                              </span>
+                            </td>
+                            <td className="px-4 py-3 text-sm text-gray-600">{result.error_message || '-'}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              )}
+
+              {/* API Response Section */}
+              {businessRuleResults && businessRuleResults.api_response && (
+                <div className="bg-white rounded-lg border border-gray-200">
+                  <div className="px-6 py-4 border-b border-gray-200">
+                    <h3 className="text-lg font-semibold text-gray-900">API Response Received</h3>
+                    <p className="text-sm text-gray-600 mt-1">
+                      Raw JSON response from the endpoint
+                    </p>
+                  </div>
+                  
+                  <div className="p-6">
+                    <pre className="bg-gray-50 p-4 rounded-lg overflow-x-auto text-xs font-mono border border-gray-200">
+                      {JSON.stringify(businessRuleResults.api_response, null, 2)}
+                    </pre>
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
     </div>
   )
 }

@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks, Form
+from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks, Form, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import create_engine, Column, Integer, String, DateTime, Boolean, Float, ForeignKey, Text
 from sqlalchemy.orm import sessionmaker, relationship, Session, declarative_base
@@ -72,7 +72,7 @@ class TestScenario(Base):
     __tablename__ = "test_scenarios"
     
     id = Column(Integer, primary_key=True, index=True)
-    mapping_id = Column(Integer, ForeignKey("mappings.id"), nullable=False)
+    mapping_id = Column(Integer, ForeignKey("mappings.id"), nullable=True)
     endpoint_id = Column(Integer, ForeignKey("api_endpoints.id"))
     name = Column(String, nullable=False)
     description = Column(Text)
@@ -81,6 +81,7 @@ class TestScenario(Base):
     request_body = Column(Text)
     expected_response = Column(Text)
     json_schema = Column(Text)
+    business_rule_id = Column(Integer, ForeignKey("custom_business_rules.id"), nullable=True)
     
     mapping = relationship("Mapping", back_populates="test_scenarios")
     endpoint = relationship("APIEndpoint", back_populates="test_scenarios")
@@ -181,7 +182,99 @@ class TokenCache(Base):
     expires_at = Column(DateTime, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
 
+class CustomBusinessRule(Base):
+    __tablename__ = "custom_business_rules"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    endpoint_id = Column(Integer, ForeignKey("api_endpoints.id"), nullable=False)
+    rule_name = Column(String, nullable=False)
+    rule_text = Column(Text, nullable=False)
+    created_date = Column(DateTime, default=datetime.utcnow)
+    updated_date = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    is_active = Column(Boolean, default=True)
+
+class BusinessRuleValidation(Base):
+    __tablename__ = "business_rule_validations"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    rule_id = Column(Integer, ForeignKey("custom_business_rules.id"), nullable=False)
+    endpoint_id = Column(Integer, ForeignKey("api_endpoints.id"), nullable=False)
+    execution_date = Column(DateTime, default=datetime.utcnow)
+    record_number = Column(Integer)
+    field_name = Column(String)
+    expected_value = Column(String)
+    actual_value = Column(String)
+    result = Column(String)
+    error_message = Column(Text)
+    rule_text = Column(Text)
+
 Base.metadata.create_all(bind=engine)
+
+# Migration: Add business_rule_id column and fix mapping_id constraint
+try:
+    from sqlalchemy import inspect, text
+    inspector = inspect(engine)
+    columns = [col['name'] for col in inspector.get_columns('test_scenarios')]
+    
+    # Add business_rule_id column if it doesn't exist
+    if 'business_rule_id' not in columns:
+        print("Adding business_rule_id column to test_scenarios table...")
+        with engine.connect() as conn:
+            conn.execute(text('ALTER TABLE test_scenarios ADD COLUMN business_rule_id INTEGER'))
+            conn.commit()
+        print("Migration: business_rule_id column added successfully!")
+    
+    # Fix NOT NULL constraint on mapping_id for SQLite
+    # SQLite doesn't support ALTER COLUMN, so we need to recreate the table
+    print("Checking mapping_id constraint...")
+    with engine.connect() as conn:
+        # Check if we need to fix the constraint by trying to insert a test row
+        try:
+            # Create a temporary table with the correct schema
+            conn.execute(text('''
+                CREATE TABLE IF NOT EXISTS test_scenarios_new (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    mapping_id INTEGER,
+                    endpoint_id INTEGER,
+                    name VARCHAR NOT NULL,
+                    description TEXT,
+                    category VARCHAR,
+                    status VARCHAR DEFAULT 'pending',
+                    request_body TEXT,
+                    expected_response TEXT,
+                    json_schema TEXT,
+                    business_rule_id INTEGER,
+                    FOREIGN KEY(mapping_id) REFERENCES mappings(id),
+                    FOREIGN KEY(endpoint_id) REFERENCES api_endpoints(id),
+                    FOREIGN KEY(business_rule_id) REFERENCES custom_business_rules(id)
+                )
+            '''))
+            
+            # Copy existing data
+            conn.execute(text('''
+                INSERT INTO test_scenarios_new (id, mapping_id, endpoint_id, name, description, category, status, request_body, expected_response, json_schema, business_rule_id)
+                SELECT id, mapping_id, endpoint_id, name, description, category, status, request_body, expected_response, json_schema, 
+                       CASE WHEN EXISTS(SELECT 1 FROM pragma_table_info('test_scenarios') WHERE name='business_rule_id') 
+                            THEN business_rule_id ELSE NULL END
+                FROM test_scenarios
+            '''))
+            
+            # Drop old table and rename new one
+            conn.execute(text('DROP TABLE test_scenarios'))
+            conn.execute(text('ALTER TABLE test_scenarios_new RENAME TO test_scenarios'))
+            conn.commit()
+            print("Migration: mapping_id constraint fixed successfully!")
+        except Exception as inner_e:
+            # If table already has correct schema, this will fail - that's OK
+            if "test_scenarios_new" in str(inner_e):
+                conn.rollback()
+                print("Migration: Schema already correct, skipping...")
+            else:
+                raise
+except Exception as e:
+    print(f"Migration warning: {str(e)}")
+    import traceback
+    traceback.print_exc()
 
 def get_db():
     db = SessionLocal()
@@ -218,7 +311,7 @@ class TestScenarioResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     
     id: int
-    mapping_id: int
+    mapping_id: Optional[int]
     endpoint_id: Optional[int]
     name: str
     description: Optional[str]
@@ -227,6 +320,7 @@ class TestScenarioResponse(BaseModel):
     request_body: Optional[str]
     expected_response: Optional[str]
     json_schema: Optional[str]
+    business_rule_id: Optional[int] = None
 
 class TestScenarioUpdate(BaseModel):
     endpoint_id: Optional[int] = None
@@ -313,6 +407,37 @@ class APIEndpointResponse(BaseModel):
     token_response_path: Optional[str]
     max_response_time_ms: int
     created_date: datetime
+
+class CustomBusinessRuleRequest(BaseModel):
+    endpoint_id: int
+    rule_name: str
+    rule_text: str
+
+class CustomBusinessRuleResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    
+    id: int
+    endpoint_id: int
+    rule_name: str
+    rule_text: str
+    created_date: datetime
+    updated_date: datetime
+    is_active: bool
+
+class BusinessRuleValidationResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    
+    id: int
+    rule_id: int
+    endpoint_id: int
+    execution_date: datetime
+    record_number: Optional[int]
+    field_name: Optional[str]
+    expected_value: Optional[str]
+    actual_value: Optional[str]
+    result: str
+    error_message: Optional[str]
+    rule_text: Optional[str]
 
 def classify_rule_with_ai(rule_text: str, client, deployment_name: str) -> dict:
     """Classify a single validation rule using OpenAI."""
@@ -517,106 +642,71 @@ Response Size: {endpoint_response.get('response_size', 0)} bytes
         # Build scenario order based on whether business rules are provided
         if mapping.business_rules:
             scenario_order = f"""
-{business_rules_scenarios}
+**SCENARIO GENERATION PRIORITY:**
 
-**POSITIVE SCENARIOS (10-12 scenarios):**
-Create multiple POSITIVE test cases that validate successful API operations:
-- Happy path with all required fields using realistic data from the endpoint response
-- Happy path with all fields (required + optional) populated
-- Minimal valid request with only required fields
-- Valid variations for each business rule (positive compliance)
-- Different valid combinations of optional fields
-- Valid boundary values (within acceptable ranges)
-- Valid data format variations (different date formats, string lengths, etc.)
-- Successful operations with different valid field combinations
-- Valid edge cases that should succeed
+1. **SCHEMA CHECK SCENARIO (1 scenario only):**
+   - Create ONE comprehensive schema validation scenario
+   - Tests that the response structure matches expected format
+   - Validates all required fields are present
+   - Category: "positive"
 
-**NEGATIVE SCENARIOS (8-10 scenarios):**
-Create NEGATIVE test cases for validation failures:
-- Missing each critical required field (one scenario per field)
-- Invalid data types for key fields
-- Invalid formats (malformed dates, invalid emails, etc.)
-- Business rule violations (one per rule)
-- Boundary value violations (too small, too large)
-- Empty strings and null values for required fields
-- Invalid field combinations
-- Special characters and injection attempts
+2. **BUSINESS RULE SCENARIOS (15-20 scenarios):**
+   - Create dedicated test scenarios for EACH business rule provided
+   - For each rule, create both positive (compliant) and negative (violation) test cases
+   - Use realistic data from the endpoint response
+   - Clearly state which business rule is being tested in the scenario name
+   - Category: "positive" for compliant cases, "negative" for violations
 
-**AUTHENTICATION & AUTHORIZATION (3-4 scenarios):**
-- Missing authentication token
-- Invalid/expired authentication token
-- Insufficient permissions
-- Valid authentication with proper access
+3. **FIELD VALIDATION SCENARIOS (10-15 scenarios):**
+   - Test each field's data type, format, and constraints
+   - Required field validations (missing, null, empty)
+   - Data type mismatches
+   - Boundary values and length constraints
+   - Invalid formats (dates, emails, etc.)
+   - Category: mostly "negative" with some "positive" edge cases
 
-**ADDITIONAL SCENARIOS (4-5 scenarios):**
-- Header validation (missing/invalid headers)
-- Content-type variations
-- Field-specific edge cases based on the mapping
-- Performance/timeout scenarios
+4. **EDGE CASE SCENARIOS (5-8 scenarios):**
+   - Special characters and encoding
+   - Concurrent field updates
+   - Optional field combinations
+   - Category: mix of "positive" and "negative"
 
-**IMPORTANT:** Generate AT LEAST 30-40 scenarios total. Ensure POSITIVE scenarios (category: "positive") outnumber or equal NEGATIVE scenarios to provide balanced test coverage.
+**IMPORTANT:** Generate AT LEAST 30-40 scenarios total. Focus heavily on business rule validation scenarios.
 """
         else:
             scenario_order = """
-**POSITIVE SCENARIOS (12-15 scenarios):**
-Create multiple POSITIVE test cases that validate successful API operations:
+**SCENARIO GENERATION PRIORITY:**
 
-1. **Core Happy Paths (4-5 scenarios):**
-   - All required fields with valid, realistic data
-   - All fields (required + optional) with valid data
-   - Minimal valid request (only required fields)
-   - Different valid combinations of optional fields
-   - Valid data with maximum allowed values
+1. **SCHEMA CHECK SCENARIO (1 scenario only):**
+   - Create ONE comprehensive schema validation scenario
+   - Tests that the response structure matches expected format
+   - Validates all required fields are present
+   - Category: "positive"
 
-2. **Data Variation Positives (4-5 scenarios):**
-   - Valid boundary values (minimum acceptable, maximum acceptable)
-   - Different valid date/time formats
-   - Different valid string lengths and patterns
-   - Valid special characters (allowed ones)
-   - Valid numeric ranges and precision
+2. **FIELD VALIDATION SCENARIOS (15-20 scenarios):**
+   - Test each field's data type, format, and constraints
+   - Required field validations (missing, null, empty)
+   - Data type mismatches
+   - Boundary values and length constraints
+   - Invalid formats (dates, emails, etc.)
+   - Category: mostly "negative" with some "positive" edge cases
 
-3. **Field Combination Positives (3-4 scenarios):**
-   - Different valid combinations of conditional fields
-   - Valid interdependent field relationships
-   - Optional field variations (some present, some absent)
-   - Valid array/list field variations
+3. **POSITIVE SCENARIOS (10-12 scenarios):**
+   - Happy path with all required fields
+   - Happy path with all fields populated
+   - Minimal valid request
+   - Valid variations of optional fields
+   - Valid boundary values
+   - Valid format variations
 
-**NEGATIVE SCENARIOS (10-12 scenarios):**
-Create NEGATIVE test cases for validation failures:
+4. **EDGE CASE SCENARIOS (5-8 scenarios):**
+   - Special characters and encoding
+   - Authentication scenarios
+   - Header validation
+   - Optional field combinations
+   - Category: mix of "positive" and "negative"
 
-1. **Required Field Validation (4-5 scenarios):**
-   - Missing each critical required field individually
-   - Missing multiple required fields
-   - Empty strings for required fields
-   - Null values for required fields
-
-2. **Data Type & Format Validation (3-4 scenarios):**
-   - Invalid data types (string instead of number, etc.)
-   - Invalid formats (malformed dates, emails, URLs)
-   - Type mismatches and conversion failures
-   - Invalid enum/choice values
-
-3. **Boundary & Constraint Violations (3-4 scenarios):**
-   - Values below minimum boundary
-   - Values above maximum boundary
-   - String length violations (too short, too long)
-   - Invalid patterns and regex failures
-
-**AUTHENTICATION & AUTHORIZATION (3-4 scenarios):**
-- Valid authentication with proper token
-- Missing authentication token
-- Invalid/malformed authentication token
-- Expired authentication token
-- Insufficient permissions/unauthorized access
-
-**ADDITIONAL SCENARIOS (4-6 scenarios):**
-- Valid and invalid header combinations
-- Content-type validation (valid and invalid)
-- Field-specific edge cases from the mapping
-- Valid concurrent field updates
-- Invalid field combinations
-
-**IMPORTANT:** Generate AT LEAST 30-40 scenarios total. Ensure POSITIVE scenarios (category: "positive") represent 40-50% of total scenarios to provide balanced test coverage. Use realistic data from the endpoint response and field definitions.
+**IMPORTANT:** Generate AT LEAST 30-40 scenarios total. Create only ONE schema check scenario.
 """
         
         prompt = f"""You are an API testing expert. Generate comprehensive test scenarios based on the following information:
@@ -662,12 +752,23 @@ Example format:
   ...
 ]
 
-**CRITICAL: Return ONLY valid JSON. Do NOT include:**
-- Comments (// or /* */)
-- Markdown formatting
-- Explanatory text
-- Code blocks
-Return pure JSON array only."""
+**CRITICAL JSON SYNTAX RULES:**
+1. Return ONLY valid JSON - no comments, no markdown, no explanatory text
+2. Do NOT use JavaScript code like .repeat(), .map(), etc. - use actual values
+3. Do NOT use template literals or string interpolation
+4. All string values must be actual strings, not code that generates strings
+5. For long repeated strings, write them out fully or use shorter examples
+6. Ensure all commas are properly placed (no trailing commas)
+7. Ensure all quotes are properly escaped
+8. Do NOT include any text before [ or after ]
+
+**EXAMPLE OF INVALID JSON (DO NOT DO THIS):**
+{{"name": "A".repeat(100)}}  ❌ WRONG - this is JavaScript code
+
+**EXAMPLE OF VALID JSON (DO THIS):**
+{{"name": "AAAAAAAAAA..."}}  ✓ CORRECT - actual string value
+
+Return pure JSON array only, starting with [ and ending with ]."""
 
         response = client.chat.completions.create(
             model=deployment_name,
@@ -2219,7 +2320,31 @@ def get_all_scenarios():
     db = next(get_db())
     try:
         scenarios = db.query(TestScenario).all()
+        # Debug logging
+        print(f"Total scenarios in database: {len(scenarios)}")
+        for s in scenarios:
+            print(f"  - ID: {s.id}, Name: {s.name}, Endpoint: {s.endpoint_id}, Mapping: {s.mapping_id}, Category: {s.category}, BusinessRule: {s.business_rule_id if hasattr(s, 'business_rule_id') else 'N/A'}")
         return scenarios
+    finally:
+        db.close()
+
+@app.get("/api/scenarios/debug")
+def debug_scenarios():
+    """Debug endpoint to see raw scenario data"""
+    db = next(get_db())
+    try:
+        scenarios = db.query(TestScenario).all()
+        result = []
+        for s in scenarios:
+            result.append({
+                "id": s.id,
+                "name": s.name,
+                "endpoint_id": s.endpoint_id,
+                "mapping_id": s.mapping_id,
+                "category": s.category,
+                "business_rule_id": s.business_rule_id if hasattr(s, 'business_rule_id') else None
+            })
+        return {"total": len(result), "scenarios": result}
     finally:
         db.close()
 
@@ -2342,17 +2467,194 @@ def export_scenarios_to_excel(mapping_id: int):
     finally:
         db.close()
 
+async def execute_business_rule_scenario(scenario_id: int, db: Session):
+    """Execute a business rule scenario and create test execution and validation results"""
+    import time
+    
+    scenario = db.query(TestScenario).filter(TestScenario.id == scenario_id).first()
+    if not scenario or not scenario.business_rule_id:
+        raise HTTPException(status_code=404, detail="Business rule scenario not found")
+    
+    rule = db.query(CustomBusinessRule).filter(CustomBusinessRule.id == scenario.business_rule_id).first()
+    if not rule:
+        raise HTTPException(status_code=404, detail="Business rule not found")
+    
+    endpoint = db.query(APIEndpoint).filter(APIEndpoint.id == scenario.endpoint_id).first()
+    if not endpoint:
+        raise HTTPException(status_code=404, detail="Endpoint not found")
+    
+    start_time = time.time()
+    
+    # Call the API endpoint
+    url = endpoint.base_url + endpoint.path
+    headers = json.loads(endpoint.headers) if endpoint.headers else {}
+    
+    if endpoint.auth_type == "bearer" and endpoint.auth_token:
+        headers["Authorization"] = f"Bearer {endpoint.auth_token}"
+    
+    # Make API call
+    if endpoint.method.upper() == "GET":
+        response = requests.get(url, headers=headers, timeout=endpoint.timeout_ms/1000)
+    elif endpoint.method.upper() == "POST":
+        body = json.loads(endpoint.default_request_body) if endpoint.default_request_body else {}
+        response = requests.post(url, json=body, headers=headers, timeout=endpoint.timeout_ms/1000)
+    else:
+        raise HTTPException(status_code=400, detail=f"Unsupported method: {endpoint.method}")
+    
+    response_time_ms = int((time.time() - start_time) * 1000)
+    response_data = response.json()
+    
+    # Extract records from response
+    records = []
+    wrapper_fields = {}
+    
+    if isinstance(response_data, list):
+        records = response_data
+    elif isinstance(response_data, dict):
+        found_array = False
+        for key, value in response_data.items():
+            if isinstance(value, list) and len(value) > 0 and isinstance(value[0], dict):
+                records = value
+                wrapper_fields = {k: v for k, v in response_data.items() if k != key}
+                found_array = True
+                break
+        if not found_array:
+            records = [response_data]
+    else:
+        records = [response_data]
+    
+    # Get schema fields
+    schema_fields = []
+    if wrapper_fields:
+        for key in wrapper_fields.keys():
+            if not isinstance(wrapper_fields[key], dict):
+                schema_fields.append(key)
+    if records and len(records) > 0:
+        schema_fields.extend(list(records[0].keys()))
+    
+    # Interpret the rule using AI
+    rule_interpretation = interpret_rule_with_ai(rule.rule_text, schema_fields)
+    
+    # Determine if wrapper or array rule
+    validation_field = rule_interpretation.get("validation_field")
+    condition_field = rule_interpretation.get("condition_field")
+    wrapper_field_keys = list(wrapper_fields.keys()) if wrapper_fields else []
+    is_wrapper_rule = (validation_field in wrapper_field_keys) or (condition_field in wrapper_field_keys)
+    
+    # Run validation
+    validation_results = []
+    pass_count = 0
+    fail_count = 0
+    
+    if is_wrapper_rule:
+        wrapper_record = {**wrapper_fields, **(records[0] if records else {})}
+        validation_result = apply_validation_rule(wrapper_record, rule_interpretation, 0)
+        validation_result["record_data"] = wrapper_record  # Add the actual record data
+        validation_results.append(validation_result)
+        if validation_result["result"] == "PASS":
+            pass_count += 1
+        else:
+            fail_count += 1
+    else:
+        for idx, record in enumerate(records, start=1):
+            enriched_record = {**wrapper_fields, **record}
+            validation_result = apply_validation_rule(enriched_record, rule_interpretation, idx)
+            validation_result["record_data"] = record  # Add the actual record data (without wrapper fields for clarity)
+            validation_results.append(validation_result)
+            if validation_result["result"] == "PASS":
+                pass_count += 1
+            else:
+                fail_count += 1
+    
+    # Create test execution
+    execution = TestExecution(
+        scenario_id=scenario_id,
+        status="completed",
+        pass_count=pass_count,
+        fail_count=fail_count,
+        total_response_time_ms=response_time_ms,
+        request_body=endpoint.default_request_body,
+        response_body=json.dumps(response_data),
+        expected_response=rule.rule_text
+    )
+    db.add(execution)
+    db.commit()
+    db.refresh(execution)
+    
+    # Create validation results
+    for val_result in validation_results:
+        validation = ValidationResult(
+            scenario_id=scenario_id,
+            execution_id=execution.id,
+            field_name=val_result["field_name"] or "business_rule",
+            expected=val_result["expected_value"],
+            actual=val_result["actual_value"],
+            status="pass" if val_result["result"] == "PASS" else "fail",
+            validation_type="BUSINESS_RULE",
+            response_time_ms=response_time_ms,
+            status_code=response.status_code
+        )
+        db.add(validation)
+    
+    db.commit()
+    
+    # Update scenario status
+    scenario.status = "completed" if fail_count == 0 else "failed"
+    db.commit()
+    
+    # Format results to match frontend expectations
+    formatted_results = []
+    for val_result in validation_results:
+        formatted_results.append({
+            "field_name": val_result.get("field_name") or "business_rule",
+            "validation_type": "BUSINESS_RULE",
+            "expected": val_result.get("expected_value"),
+            "actual": val_result.get("actual_value"),
+            "status": "pass" if val_result.get("result") == "PASS" else "fail",
+            "error_message": val_result.get("error_message"),
+            "record_data": val_result.get("record_data"),  # Include the specific record that was validated
+            "record_number": val_result.get("record_number", 0)
+        })
+    
+    return {
+        "execution_id": execution.id,
+        "status": execution.status,
+        "pass_count": pass_count,
+        "fail_count": fail_count,
+        "response_time_ms": response_time_ms,
+        "results": formatted_results  # Changed from validation_results to results
+    }
+
 @app.post("/api/scenarios/{scenario_id}/execute")
 async def execute_scenario(scenario_id: int, request_body: dict = None):
     db = next(get_db())
     try:
+        print(f"Executing scenario ID: {scenario_id}")
         scenario = db.query(TestScenario).filter(TestScenario.id == scenario_id).first()
         if not scenario:
             raise HTTPException(status_code=404, detail="Scenario not found")
         
-        result = execute_validation(scenario_id, db, request_body)
+        print(f"Scenario found: {scenario.name}, Category: {scenario.category}, Business Rule ID: {scenario.business_rule_id if hasattr(scenario, 'business_rule_id') else 'N/A'}")
+        
+        # Check if this is a business rule scenario
+        if hasattr(scenario, 'business_rule_id') and scenario.business_rule_id:
+            # Execute business rule validation
+            print(f"Executing business rule scenario...")
+            result = await execute_business_rule_scenario(scenario_id, db)
+            print(f"Business rule execution completed successfully")
+        else:
+            # Execute standard validation
+            print(f"Executing standard validation...")
+            result = execute_validation(scenario_id, db, request_body)
+            print(f"Standard validation completed successfully")
         
         return result
+    except Exception as e:
+        import traceback
+        print(f"✗ ERROR executing scenario {scenario_id}: {str(e)}")
+        print(f"Full traceback:")
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Error executing scenario: {str(e)}")
     finally:
         db.close()
 
@@ -3180,6 +3482,212 @@ def get_dashboard_stats():
     finally:
         db.close()
 
+@app.get("/api/scenarios/export-excel")
+def export_test_scenarios_to_excel(endpoint_id: Optional[int] = None, mapping_id: Optional[int] = None):
+    """Export test scenarios with their latest execution results based on filters"""
+    db = next(get_db())
+    try:
+        from io import BytesIO
+        from openpyxl import Workbook
+        from openpyxl.styles import Font, PatternFill, Alignment
+        from fastapi.responses import StreamingResponse
+        
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Test Scenarios"
+        
+        # Header styling
+        header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
+        header_font = Font(bold=True, color="FFFFFF")
+        
+        # Set headers
+        headers = ['Scenario Name', 'Category', 'Endpoint', 'Description', 'Status', 'Last Execution', 'Pass Count', 'Fail Count', 'Response Time (ms)']
+        for col_num, header in enumerate(headers, 1):
+            cell = ws.cell(row=1, column=col_num)
+            cell.value = header
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = Alignment(horizontal='center', vertical='center')
+        
+        # Query scenarios based on filters
+        query = db.query(TestScenario)
+        
+        if mapping_id:
+            query = query.filter(TestScenario.mapping_id == mapping_id)
+        elif endpoint_id:
+            query = query.filter(TestScenario.endpoint_id == endpoint_id)
+        # If no filters, get all scenarios
+        
+        scenarios = query.all()
+        
+        # Populate summary data
+        row = 2
+        for scenario in scenarios:
+            # Get endpoint name
+            endpoint = db.query(APIEndpoint).filter(APIEndpoint.id == scenario.endpoint_id).first() if scenario.endpoint_id else None
+            endpoint_name = endpoint.name if endpoint else 'N/A'
+            
+            # Get latest execution
+            latest_execution = db.query(TestExecution).filter(
+                TestExecution.scenario_id == scenario.id
+            ).order_by(TestExecution.execution_date.desc()).first()
+            
+            ws.cell(row=row, column=1).value = scenario.name
+            ws.cell(row=row, column=2).value = scenario.category or 'N/A'
+            ws.cell(row=row, column=3).value = endpoint_name
+            ws.cell(row=row, column=4).value = scenario.description or 'N/A'
+            ws.cell(row=row, column=5).value = scenario.status or 'pending'
+            
+            if latest_execution:
+                ws.cell(row=row, column=6).value = latest_execution.execution_date.strftime('%Y-%m-%d %H:%M:%S') if latest_execution.execution_date else 'N/A'
+                ws.cell(row=row, column=7).value = latest_execution.pass_count or 0
+                ws.cell(row=row, column=8).value = latest_execution.fail_count or 0
+                ws.cell(row=row, column=9).value = latest_execution.total_response_time_ms or 0
+            else:
+                ws.cell(row=row, column=6).value = 'Never executed'
+                ws.cell(row=row, column=7).value = 0
+                ws.cell(row=row, column=8).value = 0
+                ws.cell(row=row, column=9).value = 0
+            
+            row += 1
+        
+        # Create a second sheet for failure details
+        ws_failures = wb.create_sheet("Failure Details")
+        
+        # Failure sheet headers
+        failure_headers = ['Scenario Name', 'Field', 'Validation Type', 'Expected', 'Actual', 'Status', 'Error Message', 'Record Number', 'Record Data']
+        for col_num, header in enumerate(failure_headers, 1):
+            cell = ws_failures.cell(row=1, column=col_num)
+            cell.value = header
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = Alignment(horizontal='center', vertical='center')
+        
+        # Populate failure details
+        failure_row = 2
+        for scenario in scenarios:
+            # Get latest execution
+            latest_execution = db.query(TestExecution).filter(
+                TestExecution.scenario_id == scenario.id
+            ).order_by(TestExecution.execution_date.desc()).first()
+            
+            if latest_execution and latest_execution.fail_count > 0:
+                # For business rule scenarios, get the detailed failure records from BusinessRuleValidation
+                if scenario.category == 'business_rule':
+                    # Get business rule validations that failed
+                    business_validations = db.query(BusinessRuleValidation).filter(
+                        BusinessRuleValidation.endpoint_id == scenario.endpoint_id,
+                        BusinessRuleValidation.result == 'FAIL'
+                    ).order_by(BusinessRuleValidation.execution_date.desc()).all()
+                    
+                    # Parse the response to extract individual records
+                    try:
+                        import json
+                        response_data = json.loads(latest_execution.response_body) if isinstance(latest_execution.response_body, str) else latest_execution.response_body
+                        
+                        # Extract the array of records from response
+                        records = []
+                        if isinstance(response_data, list):
+                            records = response_data
+                        elif isinstance(response_data, dict):
+                            # Look for common array keys
+                            for key in ['termsAndConditions', 'data', 'results', 'items', 'records']:
+                                if key in response_data and isinstance(response_data[key], list):
+                                    records = response_data[key]
+                                    break
+                        
+                        # Match business validations with their specific records
+                        for bv in business_validations:
+                            ws_failures.cell(row=failure_row, column=1).value = scenario.name
+                            ws_failures.cell(row=failure_row, column=2).value = bv.field_name or 'N/A'
+                            ws_failures.cell(row=failure_row, column=3).value = 'BUSINESS_RULE'
+                            ws_failures.cell(row=failure_row, column=4).value = bv.expected_value or 'N/A'
+                            ws_failures.cell(row=failure_row, column=5).value = bv.actual_value or 'N/A'
+                            ws_failures.cell(row=failure_row, column=6).value = bv.result or 'FAIL'
+                            ws_failures.cell(row=failure_row, column=7).value = bv.error_message or 'N/A'
+                            ws_failures.cell(row=failure_row, column=8).value = bv.record_number or 'N/A'
+                            
+                            # Get the specific record that failed
+                            if records and bv.record_number and bv.record_number > 0 and bv.record_number <= len(records):
+                                specific_record = records[bv.record_number - 1]  # record_number is 1-indexed
+                                ws_failures.cell(row=failure_row, column=9).value = json.dumps(specific_record, indent=2)
+                            else:
+                                ws_failures.cell(row=failure_row, column=9).value = 'N/A'
+                            
+                            failure_row += 1
+                    except Exception as e:
+                        print(f"Error extracting record data: {str(e)}")
+                        ws_failures.cell(row=failure_row, column=1).value = scenario.name
+                        ws_failures.cell(row=failure_row, column=9).value = f"Error: {str(e)}"
+                        failure_row += 1
+                else:
+                    # For non-business-rule scenarios, use ValidationResult table
+                    validations = db.query(ValidationResult).filter(
+                        ValidationResult.execution_id == latest_execution.id,
+                        ValidationResult.status == 'fail'
+                    ).all()
+                    
+                    for validation in validations:
+                        ws_failures.cell(row=failure_row, column=1).value = scenario.name
+                        ws_failures.cell(row=failure_row, column=2).value = validation.field_name or 'N/A'
+                        ws_failures.cell(row=failure_row, column=3).value = validation.validation_type or 'FIELD'
+                        ws_failures.cell(row=failure_row, column=4).value = validation.expected or 'N/A'
+                        ws_failures.cell(row=failure_row, column=5).value = validation.actual or 'N/A'
+                        ws_failures.cell(row=failure_row, column=6).value = validation.status or 'fail'
+                        ws_failures.cell(row=failure_row, column=7).value = validation.root_cause or 'N/A'
+                        ws_failures.cell(row=failure_row, column=8).value = 'N/A'
+                        ws_failures.cell(row=failure_row, column=9).value = 'N/A'
+                        
+                        failure_row += 1
+        
+        # Auto-size columns for failures sheet
+        for col in ws_failures.columns:
+            max_length = 0
+            column = col[0].column_letter
+            for cell in col:
+                try:
+                    cell_value = str(cell.value)
+                    # Limit very long JSON strings for column width calculation
+                    if len(cell_value) > 100:
+                        max_length = 100
+                    elif len(cell_value) > max_length:
+                        max_length = len(cell_value)
+                except:
+                    pass
+            adjusted_width = min(max_length + 2, 80)
+            ws_failures.column_dimensions[column].width = adjusted_width
+        
+        # Auto-size columns
+        for col in ws.columns:
+            max_length = 0
+            column = col[0].column_letter
+            for cell in col:
+                try:
+                    if len(str(cell.value)) > max_length:
+                        max_length = len(str(cell.value))
+                except:
+                    pass
+            adjusted_width = min(max_length + 2, 50)
+            ws.column_dimensions[column].width = adjusted_width
+        
+        # Save to BytesIO
+        output = BytesIO()
+        wb.save(output)
+        output.seek(0)
+        
+        filename = f"test_scenarios_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        
+        return StreamingResponse(
+            output,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={
+                "Content-Disposition": f"attachment; filename={filename}"
+            }
+        )
+        
+    finally:
+        db.close()
+
 @app.get("/api/dashboard/export-excel")
 def export_dashboard_to_excel():
     """Export execution results to Excel with multiple sheets: Overall + per-endpoint"""
@@ -3271,8 +3779,9 @@ def export_dashboard_to_excel():
         ws_overall['F8'] = 'Status'
         ws_overall['G8'] = 'Root Cause'
         ws_overall['H8'] = 'Execution Date'
+        ws_overall['I8'] = 'Failed Record'
         
-        for col in ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H']:
+        for col in ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I']:
             ws_overall[f'{col}8'].fill = header_fill
             ws_overall[f'{col}8'].font = header_font
         
@@ -3292,6 +3801,45 @@ def export_dashboard_to_excel():
             ws_overall[f'F{row}'] = result.status
             ws_overall[f'G{row}'] = result.root_cause or ''
             ws_overall[f'H{row}'] = execution.execution_date.strftime('%Y-%m-%d %H:%M:%S') if execution else ''
+            
+            # Add failed record data for business rule scenarios
+            if scenario and scenario.category == 'business_rule' and execution and execution.response_body:
+                try:
+                    import json
+                    # Get business rule validations for this scenario
+                    business_validations = db.query(BusinessRuleValidation).filter(
+                        BusinessRuleValidation.endpoint_id == scenario.endpoint_id,
+                        BusinessRuleValidation.result == 'FAIL',
+                        BusinessRuleValidation.field_name == result.field_name
+                    ).order_by(BusinessRuleValidation.execution_date.desc()).first()
+                    
+                    if business_validations and business_validations.record_number:
+                        # Parse response to extract records
+                        response_data = json.loads(execution.response_body) if isinstance(execution.response_body, str) else execution.response_body
+                        
+                        # Extract array of records
+                        records = []
+                        if isinstance(response_data, list):
+                            records = response_data
+                        elif isinstance(response_data, dict):
+                            for key in ['termsAndConditions', 'data', 'results', 'items', 'records']:
+                                if key in response_data and isinstance(response_data[key], list):
+                                    records = response_data[key]
+                                    break
+                        
+                        # Get specific failing record
+                        if records and business_validations.record_number > 0 and business_validations.record_number <= len(records):
+                            specific_record = records[business_validations.record_number - 1]
+                            ws_overall[f'I{row}'] = json.dumps(specific_record, indent=2)
+                        else:
+                            ws_overall[f'I{row}'] = 'N/A'
+                    else:
+                        ws_overall[f'I{row}'] = 'N/A'
+                except Exception as e:
+                    ws_overall[f'I{row}'] = f'Error: {str(e)}'
+            else:
+                ws_overall[f'I{row}'] = 'N/A'
+            
             row += 1
         
         # Auto-size columns
@@ -3427,6 +3975,513 @@ def export_dashboard_to_excel():
             }
         )
         
+    finally:
+        db.close()
+
+@app.post("/api/business-rules", response_model=CustomBusinessRuleResponse)
+def create_business_rule(rule: CustomBusinessRuleRequest, db: Session = Depends(get_db)):
+    """Create a new custom business rule for an endpoint"""
+    new_rule = CustomBusinessRule(
+        endpoint_id=rule.endpoint_id,
+        rule_name=rule.rule_name,
+        rule_text=rule.rule_text
+    )
+    db.add(new_rule)
+    db.commit()
+    db.refresh(new_rule)
+    
+    # Automatically create a test scenario for this business rule
+    try:
+        print(f"Attempting to create test scenario for business rule: {rule.rule_name}")
+        print(f"  endpoint_id: {rule.endpoint_id}")
+        print(f"  business_rule_id: {new_rule.id}")
+        
+        test_scenario = TestScenario(
+            mapping_id=None,  # Business rules don't require mapping
+            endpoint_id=rule.endpoint_id,
+            name=f"Business Rule: {rule.rule_name}",
+            description=rule.rule_text,
+            category="business_rule",
+            status="pending",
+            business_rule_id=new_rule.id
+        )
+        db.add(test_scenario)
+        db.commit()
+        db.refresh(test_scenario)
+        print(f"✓ SUCCESS: Created test scenario with ID: {test_scenario.id} for business rule: {rule.rule_name}")
+    except Exception as e:
+        import traceback
+        print(f"✗ ERROR creating test scenario: {str(e)}")
+        print(f"Full traceback:")
+        traceback.print_exc()
+        # Don't fail the whole request if scenario creation fails
+        db.rollback()
+    
+    # Extract data before session closes
+    rule_data = {
+        "id": new_rule.id,
+        "endpoint_id": new_rule.endpoint_id,
+        "rule_name": new_rule.rule_name,
+        "rule_text": new_rule.rule_text,
+        "created_date": new_rule.created_date,
+        "updated_date": new_rule.updated_date,
+        "is_active": new_rule.is_active
+    }
+    
+    return rule_data
+
+@app.get("/api/business-rules/endpoint/{endpoint_id}", response_model=List[CustomBusinessRuleResponse])
+def get_business_rules_by_endpoint(endpoint_id: int, db: Session = Depends(get_db)):
+    """Get all business rules for a specific endpoint"""
+    try:
+        rules = db.query(CustomBusinessRule).filter(
+            CustomBusinessRule.endpoint_id == endpoint_id,
+            CustomBusinessRule.is_active == True
+        ).all()
+        return rules
+    finally:
+        db.close()
+
+@app.delete("/api/business-rules/{rule_id}")
+def delete_business_rule(rule_id: int, db: Session = Depends(get_db)):
+    """Delete a business rule"""
+    try:
+        rule = db.query(CustomBusinessRule).filter(CustomBusinessRule.id == rule_id).first()
+        if not rule:
+            raise HTTPException(status_code=404, detail="Rule not found")
+        
+        # Delete associated test scenario
+        test_scenario = db.query(TestScenario).filter(TestScenario.business_rule_id == rule_id).first()
+        if test_scenario:
+            db.delete(test_scenario)
+        
+        db.delete(rule)
+        db.commit()
+        return {"message": "Rule deleted successfully"}
+    finally:
+        db.close()
+
+@app.put("/api/business-rules/{rule_id}", response_model=CustomBusinessRuleResponse)
+def update_business_rule(rule_id: int, rule_name: str = None, rule_text: str = None, db: Session = Depends(get_db)):
+    """Update a business rule"""
+    try:
+        rule = db.query(CustomBusinessRule).filter(CustomBusinessRule.id == rule_id).first()
+        if not rule:
+            raise HTTPException(status_code=404, detail="Rule not found")
+        
+        if rule_name:
+            rule.rule_name = rule_name
+        if rule_text:
+            rule.rule_text = rule_text
+        rule.updated_date = datetime.utcnow()
+        
+        db.commit()
+        db.refresh(rule)
+        return rule
+    finally:
+        db.close()
+
+def interpret_rule_with_ai(rule_text: str, schema_fields: List[str]) -> dict:
+    """Use AI to interpret natural language rule into validation logic"""
+    client = AzureOpenAI(
+        api_key=os.getenv("AZURE_OPENAI_API_KEY"),
+        api_version=os.getenv("AZURE_OPENAI_API_VERSION"),
+        azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT")
+    )
+    deployment_name = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME")
+    
+    prompt = f"""You are a validation rule interpreter. Convert the following natural language business rule into a structured validation format.
+
+Available fields in the API response: {', '.join(schema_fields)}
+
+Business Rule: "{rule_text}"
+
+Return a JSON object with this structure:
+{{
+    "condition": "the IF condition or null if unconditional",
+    "condition_field": "field name in condition or null",
+    "condition_operator": "operator like 'startswith', 'equals', 'contains', 'is_null', 'is_not_null', 'greater_than', 'less_than'",
+    "condition_value": "value to check in condition or null",
+    "validation_field": "field to validate",
+    "validation_operator": "operator like 'must_be', 'must_not_be', 'must_be_one_of', 'must_be_null', 'must_not_be_null', 'must_be_before', 'must_be_after'",
+    "validation_value": "expected value or list of values",
+    "error_message": "user-friendly error message"
+}}
+
+Examples:
+Rule: "If title starts with HRSA- then hrsaWideFlag must be Y"
+Output: {{"condition": "title starts with HRSA-", "condition_field": "title", "condition_operator": "startswith", "condition_value": "HRSA-", "validation_field": "hrsaWideFlag", "validation_operator": "must_be", "validation_value": "Y", "error_message": "hrsaWideFlag must be Y when title starts with HRSA-"}}
+
+Rule: "trackingTypeCode must be one of: Term, Condition, Reporting Requirement"
+Output: {{"condition": null, "condition_field": null, "condition_operator": null, "condition_value": null, "validation_field": "trackingTypeCode", "validation_operator": "must_be_one_of", "validation_value": ["Term", "Condition", "Reporting Requirement"], "error_message": "trackingTypeCode must be one of: Term, Condition, Reporting Requirement"}}
+
+Rule: "activeDate should not be later than lastUpdateDate"
+Output: {{"condition": null, "condition_field": null, "condition_operator": null, "condition_value": null, "validation_field": "activeDate", "validation_operator": "must_be_before", "validation_value": "lastUpdateDate", "error_message": "activeDate should not be later than lastUpdateDate"}}
+
+Rule: "If programType is null then inactiveDate must also be null"
+Output: {{"condition": "programType is null", "condition_field": "programType", "condition_operator": "is_null", "condition_value": null, "validation_field": "inactiveDate", "validation_operator": "must_be_null", "validation_value": null, "error_message": "inactiveDate must be null when programType is null"}}
+
+Return ONLY the JSON object, no additional text."""
+
+    try:
+        response = client.chat.completions.create(
+            model=deployment_name,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=500,
+            temperature=0.1
+        )
+        
+        response_text = response.choices[0].message.content.strip()
+        
+        # Extract JSON from response
+        start_idx = response_text.find('{')
+        end_idx = response_text.rfind('}') + 1
+        if start_idx != -1 and end_idx > start_idx:
+            json_str = response_text[start_idx:end_idx]
+            result = json.loads(json_str)
+            return result
+        else:
+            raise ValueError("No JSON found in AI response")
+            
+    except Exception as e:
+        print(f"Error interpreting rule with AI: {e}")
+        return {
+            "condition": None,
+            "condition_field": None,
+            "condition_operator": None,
+            "condition_value": None,
+            "validation_field": None,
+            "validation_operator": None,
+            "validation_value": None,
+            "error_message": f"Failed to interpret rule: {str(e)}"
+        }
+
+def apply_validation_rule(record: dict, rule_interpretation: dict, record_number: int) -> dict:
+    """Apply interpreted validation rule to a single record"""
+    
+    # Check if condition is met (if there is one)
+    condition_met = True
+    if rule_interpretation.get("condition_field"):
+        field_value = record.get(rule_interpretation["condition_field"])
+        operator = rule_interpretation.get("condition_operator")
+        condition_value = rule_interpretation.get("condition_value")
+        
+        if operator == "startswith":
+            condition_met = str(field_value or "").startswith(str(condition_value))
+        elif operator == "equals":
+            condition_met = str(field_value) == str(condition_value)
+        elif operator == "contains":
+            condition_met = str(condition_value) in str(field_value or "")
+        elif operator == "is_null":
+            condition_met = field_value is None or field_value == "" or field_value == "null"
+        elif operator == "is_not_null":
+            condition_met = field_value is not None and field_value != "" and field_value != "null"
+        elif operator == "greater_than":
+            try:
+                condition_met = float(field_value) > float(condition_value)
+            except:
+                condition_met = False
+        elif operator == "less_than":
+            try:
+                condition_met = float(field_value) < float(condition_value)
+            except:
+                condition_met = False
+    
+    # If condition not met, validation passes (rule doesn't apply)
+    if not condition_met:
+        return {
+            "record_number": record_number,
+            "result": "PASS",
+            "field_name": rule_interpretation.get("validation_field"),
+            "expected_value": None,
+            "actual_value": None,
+            "error_message": "Condition not met, rule does not apply"
+        }
+    
+    # Apply validation
+    validation_field = rule_interpretation.get("validation_field")
+    actual_value = record.get(validation_field)
+    validation_operator = rule_interpretation.get("validation_operator")
+    validation_value = rule_interpretation.get("validation_value")
+    
+    result = "PASS"
+    error_message = None
+    
+    if validation_operator == "must_be":
+        if str(actual_value) != str(validation_value):
+            result = "FAIL"
+            error_message = rule_interpretation.get("error_message", f"{validation_field} must be {validation_value}")
+    
+    elif validation_operator == "must_not_be":
+        if str(actual_value) == str(validation_value):
+            result = "FAIL"
+            error_message = rule_interpretation.get("error_message", f"{validation_field} must not be {validation_value}")
+    
+    elif validation_operator == "must_be_one_of":
+        if str(actual_value) not in [str(v) for v in validation_value]:
+            result = "FAIL"
+            error_message = rule_interpretation.get("error_message", f"{validation_field} must be one of {validation_value}")
+    
+    elif validation_operator == "must_be_null":
+        if actual_value is not None and actual_value != "" and actual_value != "null":
+            result = "FAIL"
+            error_message = rule_interpretation.get("error_message", f"{validation_field} must be null")
+    
+    elif validation_operator == "must_not_be_null":
+        if actual_value is None or actual_value == "" or actual_value == "null":
+            result = "FAIL"
+            error_message = rule_interpretation.get("error_message", f"{validation_field} must not be null")
+    
+    elif validation_operator == "must_be_before":
+        # Compare dates
+        try:
+            from dateutil import parser
+            actual_date = parser.parse(str(actual_value))
+            
+            # Check if validation_value is a field name or a date string
+            if validation_value in record:
+                expected_date = parser.parse(str(record[validation_value]))
+            else:
+                expected_date = parser.parse(str(validation_value))
+            
+            if actual_date > expected_date:
+                result = "FAIL"
+                error_message = rule_interpretation.get("error_message", f"{validation_field} must be before {validation_value}")
+        except:
+            result = "FAIL"
+            error_message = f"Could not parse dates for comparison"
+    
+    elif validation_operator == "must_be_after":
+        # Compare dates
+        try:
+            from dateutil import parser
+            actual_date = parser.parse(str(actual_value))
+            
+            # Check if validation_value is a field name or a date string
+            if validation_value in record:
+                expected_date = parser.parse(str(record[validation_value]))
+            else:
+                expected_date = parser.parse(str(validation_value))
+            
+            if actual_date < expected_date:
+                result = "FAIL"
+                error_message = rule_interpretation.get("error_message", f"{validation_field} must be after {validation_value}")
+        except:
+            result = "FAIL"
+            error_message = f"Could not parse dates for comparison"
+    
+    return {
+        "record_number": record_number,
+        "result": result,
+        "field_name": validation_field,
+        "expected_value": str(validation_value) if validation_value else None,
+        "actual_value": str(actual_value) if actual_value else None,
+        "error_message": error_message
+    }
+
+@app.post("/api/business-rules/validate/{endpoint_id}")
+async def run_business_rule_validation(endpoint_id: int, db: Session = Depends(get_db)):
+    """Run all business rules for an endpoint against its API response"""
+    try:
+        # Get endpoint
+        endpoint = db.query(APIEndpoint).filter(APIEndpoint.id == endpoint_id).first()
+        if not endpoint:
+            raise HTTPException(status_code=404, detail="Endpoint not found")
+        
+        # Get all active rules for this endpoint
+        rules = db.query(CustomBusinessRule).filter(
+            CustomBusinessRule.endpoint_id == endpoint_id,
+            CustomBusinessRule.is_active == True
+        ).all()
+        
+        if not rules:
+            return {"message": "No active rules found for this endpoint", "results": []}
+        
+        # Call the API endpoint
+        url = endpoint.base_url + endpoint.path
+        headers = json.loads(endpoint.headers) if endpoint.headers else {}
+        
+        # Handle authentication
+        if endpoint.auth_type == "bearer" and endpoint.auth_token:
+            headers["Authorization"] = f"Bearer {endpoint.auth_token}"
+        
+        # Make API call
+        if endpoint.method.upper() == "GET":
+            response = requests.get(url, headers=headers, timeout=endpoint.timeout_ms/1000)
+        elif endpoint.method.upper() == "POST":
+            body = json.loads(endpoint.default_request_body) if endpoint.default_request_body else {}
+            response = requests.post(url, json=body, headers=headers, timeout=endpoint.timeout_ms/1000)
+        else:
+            raise HTTPException(status_code=400, detail=f"Unsupported method: {endpoint.method}")
+        
+        if response.status_code != 200:
+            raise HTTPException(status_code=response.status_code, detail=f"API call failed: {response.text}")
+        
+        # Parse response
+        response_data = response.json()
+        
+        # Determine if response is a list or single object
+        records = []
+        wrapper_fields = {}
+        array_key = None
+        
+        if isinstance(response_data, list):
+            records = response_data
+        elif isinstance(response_data, dict):
+            # Look for arrays in the response object
+            # Common patterns: "data", "items", "results", or any array property
+            found_array = False
+            for key, value in response_data.items():
+                if isinstance(value, list) and len(value) > 0 and isinstance(value[0], dict):
+                    # Found an array of objects - use this as records
+                    records = value
+                    array_key = key
+                    found_array = True
+                    # Store wrapper-level fields (everything except the array)
+                    wrapper_fields = {k: v for k, v in response_data.items() if k != key}
+                    break
+            
+            # If no array found, treat the whole object as a single record
+            if not found_array:
+                records = [response_data]
+        else:
+            records = [response_data]
+        
+        # Get schema fields from both wrapper and first record
+        # Include wrapper fields (totalRecords, limit, etc.) and record fields (title, hrsaWideFlag, etc.)
+        schema_fields = []
+        if wrapper_fields:
+            # Add wrapper-level fields
+            for key in wrapper_fields.keys():
+                if not isinstance(wrapper_fields[key], dict):  # Skip nested objects like "links"
+                    schema_fields.append(key)
+        
+        # Add record-level fields
+        if records and len(records) > 0:
+            schema_fields.extend(list(records[0].keys()))
+        
+        # Run each rule against all records
+        all_results = []
+        
+        for rule in rules:
+            # Interpret the rule using AI
+            rule_interpretation = interpret_rule_with_ai(rule.rule_text, schema_fields)
+            
+            # Check if referenced fields exist in schema
+            validation_field = rule_interpretation.get("validation_field")
+            condition_field = rule_interpretation.get("condition_field")
+            
+            field_warnings = []
+            if validation_field and validation_field not in schema_fields:
+                field_warnings.append(f"Warning: Field '{validation_field}' not found in API response schema")
+            if condition_field and condition_field not in schema_fields:
+                field_warnings.append(f"Warning: Field '{condition_field}' not found in API response schema")
+            
+            # Determine if this rule references wrapper-level fields or array-level fields
+            wrapper_field_keys = list(wrapper_fields.keys()) if wrapper_fields else []
+            is_wrapper_rule = (validation_field in wrapper_field_keys) or (condition_field in wrapper_field_keys)
+            
+            if is_wrapper_rule:
+                # Validate wrapper-level fields once (not per record)
+                # Merge wrapper fields with first record for validation context
+                wrapper_record = {**wrapper_fields, **(records[0] if records else {})}
+                validation_result = apply_validation_rule(wrapper_record, rule_interpretation, 0)
+                validation_result["record_number"] = None  # Wrapper validation, not tied to a specific record
+                
+                # Save validation result to database
+                db_result = BusinessRuleValidation(
+                    rule_id=rule.id,
+                    endpoint_id=endpoint_id,
+                    record_number=validation_result["record_number"],
+                    field_name=validation_result["field_name"],
+                    expected_value=validation_result["expected_value"],
+                    actual_value=validation_result["actual_value"],
+                    result=validation_result["result"],
+                    error_message=validation_result["error_message"],
+                    rule_text=rule.rule_text
+                )
+                db.add(db_result)
+                
+                all_results.append({
+                    "rule_id": rule.id,
+                    "rule_name": rule.rule_name,
+                    "rule_text": rule.rule_text,
+                    "record_number": "Wrapper",
+                    "field_name": validation_result["field_name"],
+                    "expected_value": validation_result["expected_value"],
+                    "actual_value": validation_result["actual_value"],
+                    "result": validation_result["result"],
+                    "error_message": validation_result["error_message"],
+                    "warnings": field_warnings
+                })
+            else:
+                # Apply rule to each record in the array
+                for idx, record in enumerate(records, start=1):
+                    # Merge wrapper fields into each record for context
+                    enriched_record = {**wrapper_fields, **record}
+                    validation_result = apply_validation_rule(enriched_record, rule_interpretation, idx)
+                    
+                    # Save validation result to database
+                    db_result = BusinessRuleValidation(
+                        rule_id=rule.id,
+                        endpoint_id=endpoint_id,
+                        record_number=validation_result["record_number"],
+                        field_name=validation_result["field_name"],
+                        expected_value=validation_result["expected_value"],
+                        actual_value=validation_result["actual_value"],
+                        result=validation_result["result"],
+                        error_message=validation_result["error_message"],
+                        rule_text=rule.rule_text
+                    )
+                    db.add(db_result)
+                    
+                    all_results.append({
+                        "rule_id": rule.id,
+                        "rule_name": rule.rule_name,
+                        "rule_text": rule.rule_text,
+                        "record_number": validation_result["record_number"],
+                        "field_name": validation_result["field_name"],
+                        "expected_value": validation_result["expected_value"],
+                        "actual_value": validation_result["actual_value"],
+                        "result": validation_result["result"],
+                        "error_message": validation_result["error_message"],
+                        "warnings": field_warnings
+                    })
+        
+        db.commit()
+        
+        # Calculate summary
+        total_validations = len(all_results)
+        passed = sum(1 for r in all_results if r["result"] == "PASS")
+        failed = sum(1 for r in all_results if r["result"] == "FAIL")
+        
+        return {
+            "summary": {
+                "total_validations": total_validations,
+                "passed": passed,
+                "failed": failed,
+                "total_records": len(records),
+                "total_rules": len(rules)
+            },
+            "results": all_results,
+            "api_response": response_data
+        }
+        
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Validation failed: {str(e)}")
+    finally:
+        db.close()
+
+@app.get("/api/business-rules/validation-history/{endpoint_id}")
+def get_validation_history(endpoint_id: int, db: Session = Depends(get_db)):
+    """Get validation history for an endpoint"""
+    try:
+        results = db.query(BusinessRuleValidation).filter(
+            BusinessRuleValidation.endpoint_id == endpoint_id
+        ).order_by(BusinessRuleValidation.execution_date.desc()).limit(100).all()
+        
+        return results
     finally:
         db.close()
 
