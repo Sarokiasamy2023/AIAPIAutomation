@@ -323,6 +323,13 @@ function EnhancedScenario1Tab({ mappingId }) {
   const [analyzingAll, setAnalyzingAll] = useState({})
   const [analysisProgress, setAnalysisProgress] = useState({})
   const [analysisRequested, setAnalysisRequested] = useState({})
+  
+  // Bug Creation State
+  const [showBugModal, setShowBugModal] = useState(false)
+  const [userStoryId, setUserStoryId] = useState('')
+  const [preparedBugs, setPreparedBugs] = useState([])
+  const [creatingBugs, setCreatingBugs] = useState(false)
+  const [currentScenarioId, setCurrentScenarioId] = useState(null)
 
   useEffect(() => {
     fetchScenarios()
@@ -659,6 +666,162 @@ function EnhancedScenario1Tab({ mappingId }) {
     } finally {
       setAnalyzingAll(prev => ({ ...prev, [scenarioId]: false }))
     }
+  }
+
+  const handleCreateBugs = async (scenarioId) => {
+    setCurrentScenarioId(scenarioId)
+    
+    // Get all failed test results for this scenario
+    const scenario = scenarios.find(s => s.id === scenarioId)
+    const scenarioResults = results[scenarioId]
+    
+    if (!scenarioResults || scenarioResults.fail_count === 0) {
+      alert('No failures found to create bugs for')
+      return
+    }
+    
+    // Prepare bug data from failures with comprehensive details
+    const bugs = scenarioResults.results
+      .filter(result => result.status === 'fail')
+      .map(result => {
+        // Extract field name from various possible sources
+        const fieldName = result.field_name || result.field || 
+                         (result.validation_type === 'BUSINESS_RULE' ? 'Business Rule Validation' : 'Unknown Field')
+        
+        // Build more descriptive expected/actual text
+        const expectedText = result.expected 
+          ? (fieldName !== 'Unknown Field' ? `Field "${fieldName}" should be ${result.expected}` : result.expected)
+          : 'N/A'
+        
+        const actualText = result.actual 
+          ? (fieldName !== 'Unknown Field' ? `Field "${fieldName}" is ${result.actual}` : result.actual)
+          : 'N/A'
+        
+        // Build detailed description with all failure information
+        const description = `**Test Failure Details**
+
+**Scenario:** ${scenario.name}
+**Test Category:** ${scenario.category || 'N/A'}
+**Endpoint ID:** ${scenario.endpoint_id || 'N/A'}
+**Execution Date:** ${new Date().toLocaleString()}
+
+**Failure Information:**
+- **Failed Field:** ${fieldName}
+- **Validation Type:** ${result.validation_type || result.type || 'N/A'}
+- **Expected:** ${expectedText}
+- **Actual:** ${actualText}
+- **Value:** ${result.value || 'N/A'}
+- **Status:** ${result.status}
+
+**Error Details:**
+${result.error_message || 'No error message available'}
+
+---
+*This bug was automatically created from automated API test execution.*`
+
+        // Check if payloads have actual data
+        const hasRequestPayload = scenario.request_body && 
+                                  scenario.request_body !== '{}' && 
+                                  scenario.request_body.trim() !== '' &&
+                                  JSON.stringify(scenario.request_body) !== '{}'
+        
+        const hasResponsePayload = scenarioResults.api_response && 
+                                   scenarioResults.api_response !== '{}' &&
+                                   JSON.stringify(scenarioResults.api_response) !== '{}' &&
+                                   scenarioResults.api_response.response !== ''
+        
+        // Build comprehensive reproduction steps
+        const reproSteps = `**Steps to Reproduce:**
+
+1. **Navigate to Test Scenario**
+   - Scenario ID: ${scenario.id}
+   - Scenario Name: ${scenario.name}
+   - Category: ${scenario.category || 'N/A'}
+
+2. **Execute API Request**
+   - Endpoint ID: ${scenario.endpoint_id || 'N/A'}
+   - Request Method: ${scenario.method || 'GET'}${hasRequestPayload ? '\n   - Request Body: See "Request Payload" section below' : ''}
+
+3. **Observe Validation Failure**
+   - Failed Field: ${fieldName}
+   - Validation Type: ${result.validation_type || result.type || 'N/A'}
+   - Expected: ${expectedText}
+   - Actual: ${actualText}
+
+${hasResponsePayload ? '4. **Review Response**\n   - See "Response Payload" section below for full API response\n\n' : ''}**Expected Behavior:**
+${expectedText}
+
+**Actual Behavior:**
+${actualText}`
+
+        return {
+          id: result.id,
+          title: `${scenario.name} - ${fieldName} Failed`,
+          description: description,
+          reproSteps: reproSteps,
+          severity: 'Medium',
+          priority: 2,
+          tags: ['Automated Test', 'API Validation', scenario.category || 'test'],
+          areaPath: '',
+          iterationPath: '',
+          assignedTo: '',
+          // Additional metadata for backend processing - only include if not empty
+          requestPayload: hasRequestPayload ? scenario.request_body : null,
+          responsePayload: hasResponsePayload ? scenarioResults.api_response : null,
+          expectedResult: expectedText,
+          actualResult: actualText,
+          field: fieldName,  // Use extracted field name
+          fieldName: fieldName,  // Also store as fieldName
+          testType: result.validation_type || result.type || 'N/A',
+          scenarioId: scenario.id,
+          endpointId: scenario.endpoint_id
+        }
+      })
+    
+    setPreparedBugs(bugs)
+    setShowBugModal(true)
+  }
+  
+  const handleSubmitBugs = async () => {
+    if (!userStoryId.trim()) {
+      alert('Please enter a User Story ID')
+      return
+    }
+    
+    setCreatingBugs(true)
+    
+    try {
+      const response = await fetch(`${API_BASE}/api/azure-devops/create-bugs-batch`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          user_story_id: parseInt(userStoryId),
+          bugs: preparedBugs
+        })
+      })
+      
+      const data = await response.json()
+      
+      if (response.ok) {
+        alert(`✓ Successfully created ${data.created_count} bugs in Azure DevOps!`)
+        setShowBugModal(false)
+        setUserStoryId('')
+        setPreparedBugs([])
+      } else {
+        alert(`Failed to create bugs: ${data.detail || 'Unknown error'}`)
+      }
+    } catch (error) {
+      console.error('Error creating bugs:', error)
+      alert('Failed to create bugs: ' + error.message)
+    } finally {
+      setCreatingBugs(false)
+    }
+  }
+  
+  const updateBugField = (bugId, field, value) => {
+    setPreparedBugs(prev => prev.map(bug => 
+      bug.id === bugId ? { ...bug, [field]: value } : bug
+    ))
   }
 
   const exportResults = async (scenarioId, format) => {
@@ -1191,50 +1354,82 @@ function EnhancedScenario1Tab({ mappingId }) {
                       
                       {/* Show Analyze All Failures button only when there are failures */}
                       {scenarioResults.fail_count > 0 && (
-                        <button
-                          onClick={() => handleAnalyzeAll(scenario.id)}
-                          disabled={analyzingAll[scenario.id]}
-                          style={{
-                            background: analyzingAll[scenario.id]
-                              ? '#1e293b'
-                              : 'linear-gradient(135deg, #3b82f6, #2563eb)',
-                            color: '#fff',
-                            border: 'none',
-                            borderRadius: 8,
-                            padding: '10px 20px',
-                            fontSize: 12,
-                            fontWeight: 700,
-                            letterSpacing: '0.05em',
-                            cursor: analyzingAll[scenario.id] ? 'not-allowed' : 'pointer',
-                            display: 'flex',
-                            alignItems: 'center',
-                            gap: 8,
-                            opacity: analyzingAll[scenario.id] ? 0.6 : 1,
-                            transition: 'all 0.15s'
-                          }}
-                          onMouseEnter={(e) => {
-                            if (!analyzingAll[scenario.id]) {
+                        <div style={{ display: 'flex', gap: 12, alignItems: 'center' }}>
+                          <button
+                            onClick={() => handleAnalyzeAll(scenario.id)}
+                            disabled={analyzingAll[scenario.id]}
+                            style={{
+                              background: analyzingAll[scenario.id]
+                                ? '#1e293b'
+                                : 'linear-gradient(135deg, #3b82f6, #2563eb)',
+                              color: '#fff',
+                              border: 'none',
+                              borderRadius: 8,
+                              padding: '10px 20px',
+                              fontSize: 12,
+                              fontWeight: 700,
+                              letterSpacing: '0.05em',
+                              cursor: analyzingAll[scenario.id] ? 'not-allowed' : 'pointer',
+                              display: 'flex',
+                              alignItems: 'center',
+                              gap: 8,
+                              opacity: analyzingAll[scenario.id] ? 0.6 : 1,
+                              transition: 'all 0.15s'
+                            }}
+                            onMouseEnter={(e) => {
+                              if (!analyzingAll[scenario.id]) {
+                                e.currentTarget.style.transform = 'translateY(-2px)'
+                                e.currentTarget.style.boxShadow = '0 4px 12px rgba(59, 130, 246, 0.4)'
+                              }
+                            }}
+                            onMouseLeave={(e) => {
+                              e.currentTarget.style.transform = 'translateY(0)'
+                              e.currentTarget.style.boxShadow = 'none'
+                            }}
+                          >
+                            {analyzingAll[scenario.id] ? (
+                              <>
+                                <span className="spin" style={{ display: 'inline-block' }}>◌</span>
+                                Analyzing... {Math.round(analysisProgress[scenario.id] || 0)}%
+                              </>
+                            ) : (
+                              <>
+                                <span>◇</span>
+                                Analyze All Failures
+                              </>
+                            )}
+                          </button>
+                          
+                          <button
+                            onClick={() => handleCreateBugs(scenario.id)}
+                            style={{
+                              background: 'linear-gradient(135deg, #dc2626, #b91c1c)',
+                              color: '#fff',
+                              border: 'none',
+                              borderRadius: 8,
+                              padding: '10px 20px',
+                              fontSize: 12,
+                              fontWeight: 700,
+                              letterSpacing: '0.05em',
+                              cursor: 'pointer',
+                              display: 'flex',
+                              alignItems: 'center',
+                              gap: 8,
+                              transition: 'all 0.15s'
+                            }}
+                            onMouseEnter={(e) => {
                               e.currentTarget.style.transform = 'translateY(-2px)'
-                              e.currentTarget.style.boxShadow = '0 4px 12px rgba(59, 130, 246, 0.4)'
-                            }
-                          }}
-                          onMouseLeave={(e) => {
-                            e.currentTarget.style.transform = 'translateY(0)'
-                            e.currentTarget.style.boxShadow = 'none'
-                          }}
-                        >
-                          {analyzingAll[scenario.id] ? (
-                            <>
-                              <span className="spin" style={{ display: 'inline-block' }}>◌</span>
-                              Analyzing... {Math.round(analysisProgress[scenario.id] || 0)}%
-                            </>
-                          ) : (
-                            <>
-                              <span>◇</span>
-                              Analyze All Failures
-                            </>
-                          )}
-                        </button>
+                              e.currentTarget.style.boxShadow = '0 4px 12px rgba(220, 38, 38, 0.4)'
+                            }}
+                            onMouseLeave={(e) => {
+                              e.currentTarget.style.transform = 'translateY(0)'
+                              e.currentTarget.style.boxShadow = 'none'
+                            }}
+                          >
+                            <span>🐛</span>
+                            Create Bugs for Failures
+                          </button>
+                        </div>
                       )}
                     </div>
 
@@ -2447,6 +2642,322 @@ function EnhancedScenario1Tab({ mappingId }) {
                   </div>
                 </div>
               )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Bug Creation Modal */}
+      {showBugModal && (
+        <div style={{
+          position: 'fixed',
+          top: 0,
+          left: 0,
+          right: 0,
+          bottom: 0,
+          background: 'rgba(0, 0, 0, 0.7)',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          zIndex: 1000,
+          padding: 20
+        }}>
+          <div style={{
+            background: '#fff',
+            borderRadius: 12,
+            maxWidth: 1200,
+            width: '100%',
+            maxHeight: '90vh',
+            overflow: 'auto',
+            boxShadow: '0 20px 60px rgba(0, 0, 0, 0.3)'
+          }}>
+            {/* Modal Header */}
+            <div style={{
+              padding: 24,
+              borderBottom: '1px solid #e5e7eb',
+              display: 'flex',
+              justifyContent: 'space-between',
+              alignItems: 'center',
+              background: 'linear-gradient(135deg, #dc2626, #b91c1c)',
+              color: '#fff'
+            }}>
+              <div>
+                <h2 style={{ fontSize: 20, fontWeight: 700, margin: 0 }}>
+                  🐛 Review & Create Bugs ({preparedBugs.length})
+                </h2>
+                <p style={{ fontSize: 14, margin: '8px 0 0 0', opacity: 0.9 }}>
+                  Review bug details and link to User Story before submitting to Azure DevOps
+                </p>
+              </div>
+              <button
+                onClick={() => setShowBugModal(false)}
+                style={{
+                  background: 'rgba(255, 255, 255, 0.2)',
+                  border: 'none',
+                  color: '#fff',
+                  fontSize: 24,
+                  cursor: 'pointer',
+                  width: 36,
+                  height: 36,
+                  borderRadius: 6,
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center'
+                }}
+              >
+                ×
+              </button>
+            </div>
+
+            {/* User Story ID Input */}
+            <div style={{ padding: 24, borderBottom: '1px solid #e5e7eb', background: '#f9fafb' }}>
+              <label style={{ display: 'block', fontSize: 14, fontWeight: 600, color: '#374151', marginBottom: 8 }}>
+                User Story ID <span style={{ color: '#dc2626' }}>*</span>
+              </label>
+              <input
+                type="number"
+                value={userStoryId}
+                onChange={(e) => setUserStoryId(e.target.value)}
+                placeholder="Enter User Story ID (e.g., 420291)"
+                style={{
+                  width: '100%',
+                  padding: 12,
+                  border: '2px solid #d1d5db',
+                  borderRadius: 8,
+                  fontSize: 14,
+                  outline: 'none',
+                  transition: 'border-color 0.2s'
+                }}
+                onFocus={(e) => e.target.style.borderColor = '#3b82f6'}
+                onBlur={(e) => e.target.style.borderColor = '#d1d5db'}
+              />
+              <p style={{ fontSize: 12, color: '#6b7280', marginTop: 6 }}>
+                All bugs will be linked to this User Story in Azure DevOps
+              </p>
+            </div>
+
+            {/* Bugs List */}
+            <div style={{ padding: 24 }}>
+              {preparedBugs.map((bug, index) => (
+                <div key={bug.id} style={{
+                  border: '1px solid #e5e7eb',
+                  borderRadius: 8,
+                  padding: 20,
+                  marginBottom: 16,
+                  background: '#fff'
+                }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 16 }}>
+                    <div style={{
+                      background: '#dc2626',
+                      color: '#fff',
+                      width: 32,
+                      height: 32,
+                      borderRadius: '50%',
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'center',
+                      fontSize: 14,
+                      fontWeight: 700
+                    }}>
+                      {index + 1}
+                    </div>
+                    <h3 style={{ fontSize: 16, fontWeight: 600, color: '#111827', margin: 0, flex: 1 }}>
+                      Bug #{index + 1}
+                    </h3>
+                  </div>
+
+                  <div style={{ display: 'grid', gap: 16 }}>
+                    {/* Title */}
+                    <div>
+                      <label style={{ display: 'block', fontSize: 13, fontWeight: 600, color: '#374151', marginBottom: 6 }}>
+                        Title
+                      </label>
+                      <input
+                        type="text"
+                        value={bug.title}
+                        onChange={(e) => updateBugField(bug.id, 'title', e.target.value)}
+                        style={{
+                          width: '100%',
+                          padding: 10,
+                          border: '1px solid #d1d5db',
+                          borderRadius: 6,
+                          fontSize: 14
+                        }}
+                      />
+                    </div>
+
+                    {/* Description */}
+                    <div>
+                      <label style={{ display: 'block', fontSize: 13, fontWeight: 600, color: '#374151', marginBottom: 6 }}>
+                        Description
+                      </label>
+                      <textarea
+                        value={bug.description}
+                        onChange={(e) => updateBugField(bug.id, 'description', e.target.value)}
+                        rows={4}
+                        style={{
+                          width: '100%',
+                          padding: 10,
+                          border: '1px solid #d1d5db',
+                          borderRadius: 6,
+                          fontSize: 13,
+                          fontFamily: 'monospace',
+                          resize: 'vertical'
+                        }}
+                      />
+                    </div>
+
+                    {/* Repro Steps */}
+                    <div>
+                      <label style={{ display: 'block', fontSize: 13, fontWeight: 600, color: '#374151', marginBottom: 6 }}>
+                        Reproduction Steps
+                      </label>
+                      <textarea
+                        value={bug.reproSteps}
+                        onChange={(e) => updateBugField(bug.id, 'reproSteps', e.target.value)}
+                        rows={5}
+                        style={{
+                          width: '100%',
+                          padding: 10,
+                          border: '1px solid #d1d5db',
+                          borderRadius: 6,
+                          fontSize: 13,
+                          fontFamily: 'monospace',
+                          resize: 'vertical'
+                        }}
+                      />
+                    </div>
+
+                    {/* Metadata Grid */}
+                    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 12 }}>
+                      <div>
+                        <label style={{ display: 'block', fontSize: 13, fontWeight: 600, color: '#374151', marginBottom: 6 }}>
+                          Severity
+                        </label>
+                        <select
+                          value={bug.severity}
+                          onChange={(e) => updateBugField(bug.id, 'severity', e.target.value)}
+                          style={{
+                            width: '100%',
+                            padding: 10,
+                            border: '1px solid #d1d5db',
+                            borderRadius: 6,
+                            fontSize: 14
+                          }}
+                        >
+                          <option value="Critical">Critical</option>
+                          <option value="High">High</option>
+                          <option value="Medium">Medium</option>
+                          <option value="Low">Low</option>
+                        </select>
+                      </div>
+
+                      <div>
+                        <label style={{ display: 'block', fontSize: 13, fontWeight: 600, color: '#374151', marginBottom: 6 }}>
+                          Priority
+                        </label>
+                        <select
+                          value={bug.priority}
+                          onChange={(e) => updateBugField(bug.id, 'priority', parseInt(e.target.value))}
+                          style={{
+                            width: '100%',
+                            padding: 10,
+                            border: '1px solid #d1d5db',
+                            borderRadius: 6,
+                            fontSize: 14
+                          }}
+                        >
+                          <option value="1">1 - High</option>
+                          <option value="2">2 - Medium</option>
+                          <option value="3">3 - Low</option>
+                          <option value="4">4 - Very Low</option>
+                        </select>
+                      </div>
+
+                      <div>
+                        <label style={{ display: 'block', fontSize: 13, fontWeight: 600, color: '#374151', marginBottom: 6 }}>
+                          Assigned To
+                        </label>
+                        <input
+                          type="text"
+                          value={bug.assignedTo}
+                          onChange={(e) => updateBugField(bug.id, 'assignedTo', e.target.value)}
+                          placeholder="Email or name"
+                          style={{
+                            width: '100%',
+                            padding: 10,
+                            border: '1px solid #d1d5db',
+                            borderRadius: 6,
+                            fontSize: 14
+                          }}
+                        />
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            {/* Modal Footer */}
+            <div style={{
+              padding: 24,
+              borderTop: '1px solid #e5e7eb',
+              display: 'flex',
+              justifyContent: 'space-between',
+              alignItems: 'center',
+              background: '#f9fafb'
+            }}>
+              <div style={{ fontSize: 14, color: '#6b7280' }}>
+                {preparedBugs.length} bug{preparedBugs.length !== 1 ? 's' : ''} ready to create
+              </div>
+              <div style={{ display: 'flex', gap: 12 }}>
+                <button
+                  onClick={() => setShowBugModal(false)}
+                  style={{
+                    padding: '10px 20px',
+                    border: '1px solid #d1d5db',
+                    background: '#fff',
+                    color: '#374151',
+                    borderRadius: 8,
+                    fontSize: 14,
+                    fontWeight: 600,
+                    cursor: 'pointer'
+                  }}
+                >
+                  Cancel
+                </button>
+                <button
+                  onClick={handleSubmitBugs}
+                  disabled={creatingBugs || !userStoryId.trim()}
+                  style={{
+                    padding: '10px 24px',
+                    border: 'none',
+                    background: creatingBugs || !userStoryId.trim() 
+                      ? '#9ca3af' 
+                      : 'linear-gradient(135deg, #dc2626, #b91c1c)',
+                    color: '#fff',
+                    borderRadius: 8,
+                    fontSize: 14,
+                    fontWeight: 700,
+                    cursor: creatingBugs || !userStoryId.trim() ? 'not-allowed' : 'pointer',
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: 8
+                  }}
+                >
+                  {creatingBugs ? (
+                    <>
+                      <span className="spin" style={{ display: 'inline-block' }}>◌</span>
+                      Creating Bugs...
+                    </>
+                  ) : (
+                    <>
+                      <span>✓</span>
+                      Submit {preparedBugs.length} Bug{preparedBugs.length !== 1 ? 's' : ''} to Azure DevOps
+                    </>
+                  )}
+                </button>
+              </div>
             </div>
           </div>
         </div>

@@ -3,8 +3,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import create_engine, Column, Integer, String, DateTime, Boolean, Float, ForeignKey, Text
 from sqlalchemy.orm import sessionmaker, relationship, Session, declarative_base
 from pydantic import BaseModel, ConfigDict
-from typing import List, Optional
-from datetime import datetime
+from typing import List, Optional, Dict
+from datetime import datetime, time
 import os
 import pandas as pd
 from openai import AzureOpenAI
@@ -15,6 +15,12 @@ import requests
 import json
 import httpx
 from schema_validator import SchemaValidator
+from email_service import EmailService
+from azure_devops_service import AzureDevOpsService
+from report_parser import ReportParser
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.cron import CronTrigger
+import glob
 
 load_dotenv()
 
@@ -172,6 +178,23 @@ class APIEndpoint(Base):
     
     environment = relationship("Environment", back_populates="endpoints")
     test_scenarios = relationship("TestScenario", back_populates="endpoint")
+    user_story_link = relationship("UserStoryLink", back_populates="endpoint", uselist=False, cascade="all, delete-orphan")
+
+class UserStoryLink(Base):
+    __tablename__ = "user_story_links"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    endpoint_id = Column(Integer, ForeignKey("api_endpoints.id"), nullable=False, unique=True)
+    user_story_id = Column(Integer, nullable=False)
+    auto_create_bugs = Column(Boolean, default=True)
+    work_item_type = Column(String, default="Bug")
+    area_path = Column(String, nullable=True)
+    iteration_path = Column(String, nullable=True)
+    assigned_to = Column(String, nullable=True)
+    created_date = Column(DateTime, default=datetime.utcnow)
+    updated_date = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    endpoint = relationship("APIEndpoint", back_populates="user_story_link")
 
 class TokenCache(Base):
     __tablename__ = "token_cache"
@@ -192,6 +215,8 @@ class CustomBusinessRule(Base):
     created_date = Column(DateTime, default=datetime.utcnow)
     updated_date = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     is_active = Column(Boolean, default=True)
+    
+    endpoint = relationship("APIEndpoint")
 
 class BusinessRuleValidation(Base):
     __tablename__ = "business_rule_validations"
@@ -202,13 +227,24 @@ class BusinessRuleValidation(Base):
     execution_date = Column(DateTime, default=datetime.utcnow)
     record_number = Column(Integer)
     field_name = Column(String)
-    expected_value = Column(String)
-    actual_value = Column(String)
+    expected_value = Column(Text)
+    actual_value = Column(Text)
     result = Column(String)
     error_message = Column(Text)
     rule_text = Column(Text)
+    
+    rule = relationship("CustomBusinessRule")
+    endpoint = relationship("APIEndpoint")
 
 Base.metadata.create_all(bind=engine)
+
+email_service = EmailService()
+azure_devops_service = AzureDevOpsService()
+scheduler = BackgroundScheduler()
+scheduler.start()
+
+REPORTS_DIR = Path(__file__).parent.parent / "Reports"
+REPORTS_DIR.mkdir(exist_ok=True)
 
 # Migration: Add business_rule_id column and fix mapping_id constraint
 try:
@@ -282,6 +318,41 @@ def get_db():
         yield db
     finally:
         db.close()
+
+def auto_create_bug_for_failure(db, endpoint_id: int, failure_data: Dict):
+    """
+    Automatically create a bug in Azure DevOps if the endpoint has a linked user story.
+    
+    Args:
+        db: Database session
+        endpoint_id: ID of the API endpoint
+        failure_data: Dictionary containing failure information
+    """
+    try:
+        # Check if endpoint has a user story link
+        user_story_link = db.query(UserStoryLink).filter(
+            UserStoryLink.endpoint_id == endpoint_id,
+            UserStoryLink.auto_create_bugs == True
+        ).first()
+        
+        if not user_story_link:
+            return None
+        
+        # Create bug under the linked user story
+        result = azure_devops_service.create_task_under_user_story(
+            failure_data=failure_data,
+            parent_work_item_id=user_story_link.user_story_id,
+            work_item_type=user_story_link.work_item_type,
+            area_path=user_story_link.area_path,
+            iteration_path=user_story_link.iteration_path,
+            assigned_to=user_story_link.assigned_to,
+            tags=["Automated Test", "API Validation Failure", "O&M"]
+        )
+        
+        return result
+    except Exception as e:
+        print(f"Error auto-creating bug: {str(e)}")
+        return None
 
 class MappingResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
@@ -1337,7 +1408,7 @@ def compare_excel_row_to_record(row_data: dict, record: dict, text_content_field
             })
     return field_results
 
-def execute_validation(scenario_id: int, db: Session, request_body: dict = None):
+async def execute_validation(scenario_id: int, db: Session, request_body: dict = None):
     """Execute validation with 5 types: SCHEMA, TYPE, STATUS_CODE, RESPONSE_TIME, and JSON_SCHEMA checks."""
     import json
     import requests
@@ -1946,7 +2017,31 @@ def execute_validation(scenario_id: int, db: Session, request_body: dict = None)
         scenario.status = "completed"
         db.commit()
         
-        return {
+        # Auto-create bugs for failures if endpoint has user story link
+        bug_created = None
+        if fail_count > 0:
+            # Collect failure details for bug creation
+            failed_validations = [r for r in results if r.get('status') == 'fail']
+            if failed_validations:
+                failure_data = {
+                    'title': f"API Validation Failure: {scenario.name} - {endpoint.name}",
+                    'scenario_name': scenario.name,
+                    'field_name': ', '.join([f.get('field_name', 'Unknown') for f in failed_validations[:3]]),
+                    'expected': 'All validations should pass',
+                    'actual': f'{fail_count} validation(s) failed',
+                    'root_cause': failed_validations[0].get('root_cause', 'Validation failed'),
+                    'suggested_action': f"Review and fix the failing validations. Failed: {fail_count}, Passed: {pass_count}",
+                    'endpoint': endpoint.name,
+                    'execution_date': datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S'),
+                    'request_body': json.dumps(json.loads(scenario.request_body) if scenario.request_body else {}, indent=2),
+                    'response_body': json.dumps(api_response, indent=2) if api_response else 'No response',
+                    'priority': 2 if fail_count > 3 else 3,
+                    'severity': '2 - High' if fail_count > 3 else '3 - Medium'
+                }
+                
+                bug_created = auto_create_bug_for_failure(db, endpoint.id, failure_data)
+        
+        response_data = {
             "execution_id": execution.id,
             "pass_count": pass_count,
             "fail_count": fail_count,
@@ -1956,6 +2051,12 @@ def execute_validation(scenario_id: int, db: Session, request_body: dict = None)
             "actual_response": api_response if api_response else {},
             "expected_response": json.loads(scenario.expected_response) if scenario.expected_response else {}
         }
+        
+        # Add bug creation info if applicable
+        if bug_created:
+            response_data["bug_created"] = bug_created
+        
+        return response_data
         
     except Exception as e:
         if 'execution' in locals():
@@ -2645,7 +2746,7 @@ async def execute_scenario(scenario_id: int, request_body: dict = None):
         else:
             # Execute standard validation
             print(f"Executing standard validation...")
-            result = execute_validation(scenario_id, db, request_body)
+            result = await execute_validation(scenario_id, db, request_body)
             print(f"Standard validation completed successfully")
         
         return result
@@ -3978,61 +4079,345 @@ def export_dashboard_to_excel():
     finally:
         db.close()
 
-@app.post("/api/business-rules", response_model=CustomBusinessRuleResponse)
-def create_business_rule(rule: CustomBusinessRuleRequest, db: Session = Depends(get_db)):
-    """Create a new custom business rule for an endpoint"""
-    new_rule = CustomBusinessRule(
-        endpoint_id=rule.endpoint_id,
-        rule_name=rule.rule_name,
-        rule_text=rule.rule_text
-    )
-    db.add(new_rule)
-    db.commit()
-    db.refresh(new_rule)
+class UserStoryLinkCreate(BaseModel):
+    endpoint_id: int
+    user_story_id: int
+    auto_create_bugs: bool = True
+    work_item_type: str = "Bug"
+    area_path: Optional[str] = None
+    iteration_path: Optional[str] = None
+    assigned_to: Optional[str] = None
+
+class UserStoryLinkResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
     
-    # Automatically create a test scenario for this business rule
+    id: int
+    endpoint_id: int
+    user_story_id: int
+    auto_create_bugs: bool
+    work_item_type: str
+    area_path: Optional[str]
+    iteration_path: Optional[str]
+    assigned_to: Optional[str]
+    created_date: datetime
+    updated_date: datetime
+
+class CreateTasksRequest(BaseModel):
+    parent_work_item_id: int
+    failure_ids: Optional[List[int]] = None
+    from_excel: bool = False
+    work_item_type: str = "Bug"
+    area_path: Optional[str] = None
+    iteration_path: Optional[str] = None
+    assigned_to: Optional[str] = None
+    attach_report: bool = True
+    auto_create_on_failure: bool = False
+
+@app.post("/api/user-story-links", response_model=UserStoryLinkResponse)
+async def create_user_story_link(link: UserStoryLinkCreate):
+    """Link a User Story to an API endpoint for automatic bug creation on validation failures."""
+    db = next(get_db())
     try:
-        print(f"Attempting to create test scenario for business rule: {rule.rule_name}")
-        print(f"  endpoint_id: {rule.endpoint_id}")
-        print(f"  business_rule_id: {new_rule.id}")
+        # Check if endpoint exists
+        endpoint = db.query(APIEndpoint).filter(APIEndpoint.id == link.endpoint_id).first()
+        if not endpoint:
+            raise HTTPException(status_code=404, detail="Endpoint not found")
         
-        test_scenario = TestScenario(
-            mapping_id=None,  # Business rules don't require mapping
-            endpoint_id=rule.endpoint_id,
-            name=f"Business Rule: {rule.rule_name}",
-            description=rule.rule_text,
-            category="business_rule",
-            status="pending",
-            business_rule_id=new_rule.id
-        )
-        db.add(test_scenario)
+        # Check if link already exists
+        existing_link = db.query(UserStoryLink).filter(UserStoryLink.endpoint_id == link.endpoint_id).first()
+        if existing_link:
+            raise HTTPException(status_code=400, detail="User story link already exists for this endpoint. Use PUT to update.")
+        
+        # Create new link
+        db_link = UserStoryLink(**link.model_dump())
+        db.add(db_link)
         db.commit()
-        db.refresh(test_scenario)
-        print(f"✓ SUCCESS: Created test scenario with ID: {test_scenario.id} for business rule: {rule.rule_name}")
-    except Exception as e:
-        import traceback
-        print(f"✗ ERROR creating test scenario: {str(e)}")
-        print(f"Full traceback:")
-        traceback.print_exc()
-        # Don't fail the whole request if scenario creation fails
-        db.rollback()
-    
-    # Extract data before session closes
-    rule_data = {
-        "id": new_rule.id,
-        "endpoint_id": new_rule.endpoint_id,
-        "rule_name": new_rule.rule_name,
-        "rule_text": new_rule.rule_text,
-        "created_date": new_rule.created_date,
-        "updated_date": new_rule.updated_date,
-        "is_active": new_rule.is_active
-    }
-    
-    return rule_data
+        db.refresh(db_link)
+        return db_link
+    finally:
+        db.close()
+
+@app.get("/api/user-story-links/endpoint/{endpoint_id}", response_model=UserStoryLinkResponse)
+async def get_user_story_link_by_endpoint(endpoint_id: int):
+    """Get user story link for a specific endpoint."""
+    db = next(get_db())
+    try:
+        link = db.query(UserStoryLink).filter(UserStoryLink.endpoint_id == endpoint_id).first()
+        if not link:
+            raise HTTPException(status_code=404, detail="No user story link found for this endpoint")
+        return link
+    finally:
+        db.close()
+
+@app.get("/api/user-story-links", response_model=List[UserStoryLinkResponse])
+async def get_all_user_story_links():
+    """Get all user story links."""
+    db = next(get_db())
+    try:
+        links = db.query(UserStoryLink).all()
+        return links
+    finally:
+        db.close()
+
+@app.put("/api/user-story-links/{link_id}", response_model=UserStoryLinkResponse)
+async def update_user_story_link(link_id: int, link: UserStoryLinkCreate):
+    """Update an existing user story link."""
+    db = next(get_db())
+    try:
+        db_link = db.query(UserStoryLink).filter(UserStoryLink.id == link_id).first()
+        if not db_link:
+            raise HTTPException(status_code=404, detail="User story link not found")
+        
+        for key, value in link.model_dump().items():
+            setattr(db_link, key, value)
+        
+        db_link.updated_date = datetime.utcnow()
+        db.commit()
+        db.refresh(db_link)
+        return db_link
+    finally:
+        db.close()
+
+@app.delete("/api/user-story-links/{link_id}")
+async def delete_user_story_link(link_id: int):
+    """Delete a user story link."""
+    db = next(get_db())
+    try:
+        db_link = db.query(UserStoryLink).filter(UserStoryLink.id == link_id).first()
+        if not db_link:
+            raise HTTPException(status_code=404, detail="User story link not found")
+        
+        db.delete(db_link)
+        db.commit()
+        return {"status": "success", "message": "User story link deleted"}
+    finally:
+        db.close()
+
+@app.post("/api/azure-devops/test-connection")
+async def test_azure_devops_connection():
+    """Test Azure DevOps connection and credentials."""
+    return azure_devops_service.test_connection()
+
+@app.post("/api/azure-devops/create-tasks-from-excel")
+async def create_tasks_from_excel_failures(request: CreateTasksRequest):
+    """Create Azure DevOps tasks under a user story from Excel report failures with comprehensive analysis."""
+    db = next(get_db())
+    try:
+        # Parse the latest Excel report to get failures
+        from report_parser import ReportParser
+        latest_report = get_latest_report_file()
+        
+        if not latest_report:
+            raise HTTPException(status_code=404, detail="No Excel report found in Reports folder")
+        
+        parser = ReportParser(latest_report)
+        report_data = parser.generate_email_summary()
+        
+        # Get existing tasks under the user story to avoid duplicates
+        existing_tasks = azure_devops_service.get_child_work_items(request.parent_work_item_id)
+        existing_task_titles = set(task.get('title', '') for task in existing_tasks.get('work_items', []))
+        
+        failures_data = []
+        skipped_duplicates = []
+        
+        for issue in report_data.get('issues', []):
+            scenario_name = issue.get('scenario', 'Unknown Scenario')
+            endpoint_name = issue.get('endpoint', 'Unknown')
+            description = issue.get('description', '')
+            
+            # Create unique task title
+            task_title = f"Fix Test Failure: {scenario_name} - {endpoint_name}"
+            
+            # Check for duplicates
+            if task_title in existing_task_titles:
+                skipped_duplicates.append(task_title)
+                continue
+            
+            # Generate comprehensive root cause analysis using AI
+            root_cause_prompt = f"""Analyze this test failure and provide root cause:
+Scenario: {scenario_name}
+Endpoint: {endpoint_name}
+Description: {description}
+Failed: {issue.get('fail_count', 0)} times
+Passed: {issue.get('pass_count', 0)} times
+Response Time: {issue.get('response_time', 0)}ms
+
+Provide a concise root cause analysis (2-3 sentences)."""
+            
+            try:
+                ai_response = client.chat.completions.create(
+                    model=deployment_name,
+                    messages=[
+                        {"role": "system", "content": "You are an API testing expert. Analyze test failures and provide concise root cause analysis."},
+                        {"role": "user", "content": root_cause_prompt}
+                    ],
+                    max_tokens=200,
+                    temperature=0.3
+                )
+                root_cause = ai_response.choices[0].message.content.strip()
+            except Exception as e:
+                root_cause = f"Test validation failed. Failed {issue.get('fail_count', 0)} times out of {issue.get('fail_count', 0) + issue.get('pass_count', 0)} executions."
+            
+            # Generate suggested action
+            suggested_action_prompt = f"""Based on this test failure, provide specific action items:
+Scenario: {scenario_name}
+Endpoint: {endpoint_name}
+Root Cause: {root_cause}
+
+Provide 2-3 specific action items to fix this issue."""
+            
+            try:
+                ai_response = client.chat.completions.create(
+                    model=deployment_name,
+                    messages=[
+                        {"role": "system", "content": "You are an API testing expert. Provide specific, actionable steps to fix test failures."},
+                        {"role": "user", "content": suggested_action_prompt}
+                    ],
+                    max_tokens=250,
+                    temperature=0.3
+                )
+                suggested_action = ai_response.choices[0].message.content.strip()
+            except Exception as e:
+                suggested_action = f"1. Review the test scenario '{scenario_name}'\n2. Verify API endpoint '{endpoint_name}' implementation\n3. Update test data or API logic as needed"
+            
+            failure_data = {
+                'title': task_title,
+                'scenario_name': scenario_name,
+                'field_name': description or 'Test Validation',
+                'expected': 'All validations should pass',
+                'actual': f'{issue.get("fail_count", 0)} validation failures detected',
+                'root_cause': root_cause,
+                'suggested_action': suggested_action,
+                'endpoint': endpoint_name,
+                'execution_date': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                'request_body': f'See attached Excel report for detailed request/response data',
+                'response_body': f"Scenario: {scenario_name}\nStatus: {issue.get('status', 'FAIL')}\nPass Count: {issue.get('pass_count', 0)}\nFail Count: {issue.get('fail_count', 0)}\nResponse Time: {issue.get('response_time', 0)}ms",
+                'priority': 2 if issue.get('fail_count', 0) > 5 else 3
+            }
+            failures_data.append(failure_data)
+        
+        if not failures_data:
+            message = "No new failures to create tasks for."
+            if skipped_duplicates:
+                message += f" Skipped {len(skipped_duplicates)} duplicate tasks."
+            return {
+                "status": "success",
+                "message": message,
+                "created_count": 0,
+                "created_items": [],
+                "skipped_duplicates": skipped_duplicates
+            }
+        
+        # Attach Excel report to the parent User Story first
+        attachment_result = None
+        if request.attach_report and latest_report:
+            print(f"Attaching Excel report to User Story {request.parent_work_item_id}...")
+            attachment_result = azure_devops_service.attach_file_to_work_item(
+                work_item_id=request.parent_work_item_id,
+                file_path=latest_report,
+                comment=f"Test Execution Report - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - {len(failures_data)} failures detected"
+            )
+            print(f"Attachment result: {attachment_result}")
+        
+        # Create tasks for failures (without attaching report to each task)
+        result = azure_devops_service.create_tasks_for_failures(
+            failures=failures_data,
+            parent_work_item_id=request.parent_work_item_id,
+            attach_report=False,  # Don't attach to individual tasks
+            report_path=latest_report,
+            work_item_type=request.work_item_type,
+            area_path=request.area_path,
+            iteration_path=request.iteration_path,
+            assigned_to=request.assigned_to,
+            tags=["Automated Test", "API Test Failure", "O&M"]
+        )
+        
+        # Add skipped duplicates info to result
+        result['skipped_duplicates'] = skipped_duplicates
+        result['skipped_count'] = len(skipped_duplicates)
+        if skipped_duplicates:
+            result['message'] += f" (Skipped {len(skipped_duplicates)} duplicates)"
+        
+        # Add attachment result to response
+        if attachment_result:
+            result['excel_attachment'] = attachment_result
+        
+        return result
+        
+    finally:
+        db.close()
+
+@app.post("/api/azure-devops/create-tasks-from-validation")
+async def create_tasks_from_validation_failures(request: CreateTasksRequest):
+    """Create Azure DevOps tasks under a user story from validation result failures."""
+    db = next(get_db())
+    try:
+        if not request.failure_ids:
+            raise HTTPException(status_code=400, detail="failure_ids is required")
+        
+        failures_data = []
+        
+        for failure_id in request.failure_ids:
+            validation_result = db.query(ValidationResult).filter(
+                ValidationResult.id == failure_id
+            ).first()
+            
+            if not validation_result:
+                continue
+            
+            scenario = validation_result.scenario
+            execution = validation_result.execution
+            endpoint = scenario.endpoint if scenario else None
+            
+            failure_data = {
+                'title': f"Fix Test Failure: {scenario.name if scenario else 'Unknown'} - {validation_result.field_name}",
+                'scenario_name': scenario.name if scenario else 'Unknown Scenario',
+                'field_name': validation_result.field_name,
+                'expected': validation_result.expected or 'N/A',
+                'actual': validation_result.actual or 'N/A',
+                'root_cause': validation_result.root_cause or 'Not analyzed',
+                'suggested_action': validation_result.suggested_action or 'Review and fix the failing validation',
+                'endpoint': f"{endpoint.base_url}{endpoint.path}" if endpoint else 'Unknown',
+                'execution_date': execution.execution_date.strftime('%Y-%m-%d %H:%M:%S') if execution else datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                'request_body': execution.request_body if execution else 'N/A',
+                'response_body': execution.response_body if execution else 'N/A',
+                'priority': 2
+            }
+            failures_data.append(failure_data)
+        
+        if not failures_data:
+            raise HTTPException(status_code=404, detail="No valid failures found")
+        
+        report_path = get_latest_report_file() if request.attach_report else None
+        
+        result = azure_devops_service.create_tasks_for_failures(
+            failures=failures_data,
+            parent_work_item_id=request.parent_work_item_id,
+            attach_report=request.attach_report,
+            report_path=report_path,
+            work_item_type=request.work_item_type,
+            area_path=request.area_path,
+            iteration_path=request.iteration_path,
+            assigned_to=request.assigned_to
+        )
+        
+        return result
+        
+    finally:
+        db.close()
+
+def get_latest_report_file():
+    """Get the most recent report file from the Reports directory."""
+    report_files = list(REPORTS_DIR.glob("*.xlsx"))
+    if not report_files:
+        return None
+    latest_file = max(report_files, key=lambda p: p.stat().st_mtime)
+    return str(latest_file)
 
 @app.get("/api/business-rules/endpoint/{endpoint_id}", response_model=List[CustomBusinessRuleResponse])
-def get_business_rules_by_endpoint(endpoint_id: int, db: Session = Depends(get_db)):
-    """Get all business rules for a specific endpoint"""
+def get_business_rules_by_endpoint(endpoint_id: int):
+    """Get all business rules for a specific endpoint."""
+    db = next(get_db())
     try:
         rules = db.query(CustomBusinessRule).filter(
             CustomBusinessRule.endpoint_id == endpoint_id,
@@ -4042,448 +4427,612 @@ def get_business_rules_by_endpoint(endpoint_id: int, db: Session = Depends(get_d
     finally:
         db.close()
 
-@app.delete("/api/business-rules/{rule_id}")
-def delete_business_rule(rule_id: int, db: Session = Depends(get_db)):
-    """Delete a business rule"""
+@app.get("/api/business-rules", response_model=List[CustomBusinessRuleResponse])
+def get_all_business_rules():
+    """Get all business rules."""
+    db = next(get_db())
     try:
-        rule = db.query(CustomBusinessRule).filter(CustomBusinessRule.id == rule_id).first()
-        if not rule:
-            raise HTTPException(status_code=404, detail="Rule not found")
-        
-        # Delete associated test scenario
-        test_scenario = db.query(TestScenario).filter(TestScenario.business_rule_id == rule_id).first()
-        if test_scenario:
-            db.delete(test_scenario)
-        
-        db.delete(rule)
+        rules = db.query(CustomBusinessRule).filter(
+            CustomBusinessRule.is_active == True
+        ).all()
+        return rules
+    finally:
+        db.close()
+
+@app.post("/api/business-rules", response_model=CustomBusinessRuleResponse)
+def create_business_rule(rule: CustomBusinessRuleRequest):
+    """Create a new business rule."""
+    db = next(get_db())
+    try:
+        new_rule = CustomBusinessRule(
+            endpoint_id=rule.endpoint_id,
+            rule_name=rule.rule_name,
+            rule_text=rule.rule_text,
+            is_active=True
+        )
+        db.add(new_rule)
         db.commit()
-        return {"message": "Rule deleted successfully"}
+        db.refresh(new_rule)
+        return new_rule
     finally:
         db.close()
 
 @app.put("/api/business-rules/{rule_id}", response_model=CustomBusinessRuleResponse)
-def update_business_rule(rule_id: int, rule_name: str = None, rule_text: str = None, db: Session = Depends(get_db)):
-    """Update a business rule"""
+def update_business_rule(rule_id: int, rule: CustomBusinessRuleRequest):
+    """Update an existing business rule."""
+    db = next(get_db())
+    try:
+        db_rule = db.query(CustomBusinessRule).filter(CustomBusinessRule.id == rule_id).first()
+        if not db_rule:
+            raise HTTPException(status_code=404, detail="Business rule not found")
+        
+        db_rule.endpoint_id = rule.endpoint_id
+        db_rule.rule_name = rule.rule_name
+        db_rule.rule_text = rule.rule_text
+        db_rule.updated_date = datetime.utcnow()
+        
+        db.commit()
+        db.refresh(db_rule)
+        return db_rule
+    finally:
+        db.close()
+
+@app.delete("/api/business-rules/{rule_id}")
+def delete_business_rule(rule_id: int):
+    """Delete a business rule (soft delete by setting is_active to False)."""
+    db = next(get_db())
     try:
         rule = db.query(CustomBusinessRule).filter(CustomBusinessRule.id == rule_id).first()
         if not rule:
-            raise HTTPException(status_code=404, detail="Rule not found")
+            raise HTTPException(status_code=404, detail="Business rule not found")
         
-        if rule_name:
-            rule.rule_name = rule_name
-        if rule_text:
-            rule.rule_text = rule_text
-        rule.updated_date = datetime.utcnow()
-        
+        rule.is_active = False
         db.commit()
-        db.refresh(rule)
-        return rule
+        return {"message": "Business rule deleted successfully"}
     finally:
         db.close()
 
-def interpret_rule_with_ai(rule_text: str, schema_fields: List[str]) -> dict:
-    """Use AI to interpret natural language rule into validation logic"""
-    client = AzureOpenAI(
-        api_key=os.getenv("AZURE_OPENAI_API_KEY"),
-        api_version=os.getenv("AZURE_OPENAI_API_VERSION"),
-        azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT")
-    )
-    deployment_name = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME")
-    
-    prompt = f"""You are a validation rule interpreter. Convert the following natural language business rule into a structured validation format.
+@app.post("/api/email/test-connection")
+async def test_email_connection():
+    """Test email SMTP connection and credentials."""
+    return email_service.test_connection()
 
-Available fields in the API response: {', '.join(schema_fields)}
+@app.get("/api/email/schedules")
+async def get_email_schedules():
+    """Get all scheduled email reports."""
+    # Return empty list for now - can be implemented later if needed
+    return []
 
-Business Rule: "{rule_text}"
-
-Return a JSON object with this structure:
-{{
-    "condition": "the IF condition or null if unconditional",
-    "condition_field": "field name in condition or null",
-    "condition_operator": "operator like 'startswith', 'equals', 'contains', 'is_null', 'is_not_null', 'greater_than', 'less_than'",
-    "condition_value": "value to check in condition or null",
-    "validation_field": "field to validate",
-    "validation_operator": "operator like 'must_be', 'must_not_be', 'must_be_one_of', 'must_be_null', 'must_not_be_null', 'must_be_before', 'must_be_after'",
-    "validation_value": "expected value or list of values",
-    "error_message": "user-friendly error message"
-}}
-
-Examples:
-Rule: "If title starts with HRSA- then hrsaWideFlag must be Y"
-Output: {{"condition": "title starts with HRSA-", "condition_field": "title", "condition_operator": "startswith", "condition_value": "HRSA-", "validation_field": "hrsaWideFlag", "validation_operator": "must_be", "validation_value": "Y", "error_message": "hrsaWideFlag must be Y when title starts with HRSA-"}}
-
-Rule: "trackingTypeCode must be one of: Term, Condition, Reporting Requirement"
-Output: {{"condition": null, "condition_field": null, "condition_operator": null, "condition_value": null, "validation_field": "trackingTypeCode", "validation_operator": "must_be_one_of", "validation_value": ["Term", "Condition", "Reporting Requirement"], "error_message": "trackingTypeCode must be one of: Term, Condition, Reporting Requirement"}}
-
-Rule: "activeDate should not be later than lastUpdateDate"
-Output: {{"condition": null, "condition_field": null, "condition_operator": null, "condition_value": null, "validation_field": "activeDate", "validation_operator": "must_be_before", "validation_value": "lastUpdateDate", "error_message": "activeDate should not be later than lastUpdateDate"}}
-
-Rule: "If programType is null then inactiveDate must also be null"
-Output: {{"condition": "programType is null", "condition_field": "programType", "condition_operator": "is_null", "condition_value": null, "validation_field": "inactiveDate", "validation_operator": "must_be_null", "validation_value": null, "error_message": "inactiveDate must be null when programType is null"}}
-
-Return ONLY the JSON object, no additional text."""
-
-    try:
-        response = client.chat.completions.create(
-            model=deployment_name,
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=500,
-            temperature=0.1
-        )
-        
-        response_text = response.choices[0].message.content.strip()
-        
-        # Extract JSON from response
-        start_idx = response_text.find('{')
-        end_idx = response_text.rfind('}') + 1
-        if start_idx != -1 and end_idx > start_idx:
-            json_str = response_text[start_idx:end_idx]
-            result = json.loads(json_str)
-            return result
-        else:
-            raise ValueError("No JSON found in AI response")
-            
-    except Exception as e:
-        print(f"Error interpreting rule with AI: {e}")
-        return {
-            "condition": None,
-            "condition_field": None,
-            "condition_operator": None,
-            "condition_value": None,
-            "validation_field": None,
-            "validation_operator": None,
-            "validation_value": None,
-            "error_message": f"Failed to interpret rule: {str(e)}"
-        }
-
-def apply_validation_rule(record: dict, rule_interpretation: dict, record_number: int) -> dict:
-    """Apply interpreted validation rule to a single record"""
-    
-    # Check if condition is met (if there is one)
-    condition_met = True
-    if rule_interpretation.get("condition_field"):
-        field_value = record.get(rule_interpretation["condition_field"])
-        operator = rule_interpretation.get("condition_operator")
-        condition_value = rule_interpretation.get("condition_value")
-        
-        if operator == "startswith":
-            condition_met = str(field_value or "").startswith(str(condition_value))
-        elif operator == "equals":
-            condition_met = str(field_value) == str(condition_value)
-        elif operator == "contains":
-            condition_met = str(condition_value) in str(field_value or "")
-        elif operator == "is_null":
-            condition_met = field_value is None or field_value == "" or field_value == "null"
-        elif operator == "is_not_null":
-            condition_met = field_value is not None and field_value != "" and field_value != "null"
-        elif operator == "greater_than":
-            try:
-                condition_met = float(field_value) > float(condition_value)
-            except:
-                condition_met = False
-        elif operator == "less_than":
-            try:
-                condition_met = float(field_value) < float(condition_value)
-            except:
-                condition_met = False
-    
-    # If condition not met, validation passes (rule doesn't apply)
-    if not condition_met:
-        return {
-            "record_number": record_number,
-            "result": "PASS",
-            "field_name": rule_interpretation.get("validation_field"),
-            "expected_value": None,
-            "actual_value": None,
-            "error_message": "Condition not met, rule does not apply"
-        }
-    
-    # Apply validation
-    validation_field = rule_interpretation.get("validation_field")
-    actual_value = record.get(validation_field)
-    validation_operator = rule_interpretation.get("validation_operator")
-    validation_value = rule_interpretation.get("validation_value")
-    
-    result = "PASS"
-    error_message = None
-    
-    if validation_operator == "must_be":
-        if str(actual_value) != str(validation_value):
-            result = "FAIL"
-            error_message = rule_interpretation.get("error_message", f"{validation_field} must be {validation_value}")
-    
-    elif validation_operator == "must_not_be":
-        if str(actual_value) == str(validation_value):
-            result = "FAIL"
-            error_message = rule_interpretation.get("error_message", f"{validation_field} must not be {validation_value}")
-    
-    elif validation_operator == "must_be_one_of":
-        if str(actual_value) not in [str(v) for v in validation_value]:
-            result = "FAIL"
-            error_message = rule_interpretation.get("error_message", f"{validation_field} must be one of {validation_value}")
-    
-    elif validation_operator == "must_be_null":
-        if actual_value is not None and actual_value != "" and actual_value != "null":
-            result = "FAIL"
-            error_message = rule_interpretation.get("error_message", f"{validation_field} must be null")
-    
-    elif validation_operator == "must_not_be_null":
-        if actual_value is None or actual_value == "" or actual_value == "null":
-            result = "FAIL"
-            error_message = rule_interpretation.get("error_message", f"{validation_field} must not be null")
-    
-    elif validation_operator == "must_be_before":
-        # Compare dates
-        try:
-            from dateutil import parser
-            actual_date = parser.parse(str(actual_value))
-            
-            # Check if validation_value is a field name or a date string
-            if validation_value in record:
-                expected_date = parser.parse(str(record[validation_value]))
-            else:
-                expected_date = parser.parse(str(validation_value))
-            
-            if actual_date > expected_date:
-                result = "FAIL"
-                error_message = rule_interpretation.get("error_message", f"{validation_field} must be before {validation_value}")
-        except:
-            result = "FAIL"
-            error_message = f"Could not parse dates for comparison"
-    
-    elif validation_operator == "must_be_after":
-        # Compare dates
-        try:
-            from dateutil import parser
-            actual_date = parser.parse(str(actual_value))
-            
-            # Check if validation_value is a field name or a date string
-            if validation_value in record:
-                expected_date = parser.parse(str(record[validation_value]))
-            else:
-                expected_date = parser.parse(str(validation_value))
-            
-            if actual_date < expected_date:
-                result = "FAIL"
-                error_message = rule_interpretation.get("error_message", f"{validation_field} must be after {validation_value}")
-        except:
-            result = "FAIL"
-            error_message = f"Could not parse dates for comparison"
-    
+@app.get("/api/email/latest-report")
+async def get_latest_email_report():
+    """Get the latest email report status."""
+    # Return placeholder for now - can be implemented later if needed
     return {
-        "record_number": record_number,
-        "result": result,
-        "field_name": validation_field,
-        "expected_value": str(validation_value) if validation_value else None,
-        "actual_value": str(actual_value) if actual_value else None,
-        "error_message": error_message
+        "status": "no_reports",
+        "message": "No email reports have been sent yet"
     }
 
-@app.post("/api/business-rules/validate/{endpoint_id}")
-async def run_business_rule_validation(endpoint_id: int, db: Session = Depends(get_db)):
-    """Run all business rules for an endpoint against its API response"""
+class SendEmailRequest(BaseModel):
+    recipients: List[str]
+    report_type: Optional[str] = "Test Execution Report"
+
+class ADSReportRequest(BaseModel):
+    user_story_id: int
+    include_test_results: Optional[bool] = False
+    test_results: Optional[Dict] = None
+
+class EnhancedADSReportRequest(BaseModel):
+    user_story_id: Optional[int] = None
+    iteration_path: Optional[str] = None
+    board_name: Optional[str] = None
+    include_test_results: Optional[bool] = False
+    test_results: Optional[Dict] = None
+    use_enhanced_styling: Optional[bool] = True
+    show_user_story_details: Optional[bool] = False
+
+@app.post("/api/email/send-report")
+async def send_email_report(request: SendEmailRequest):
+    """Send email report with latest test execution results."""
     try:
-        # Get endpoint
-        endpoint = db.query(APIEndpoint).filter(APIEndpoint.id == endpoint_id).first()
-        if not endpoint:
-            raise HTTPException(status_code=404, detail="Endpoint not found")
+        # Get the latest Excel report
+        latest_report = get_latest_report_file()
         
-        # Get all active rules for this endpoint
-        rules = db.query(CustomBusinessRule).filter(
-            CustomBusinessRule.endpoint_id == endpoint_id,
-            CustomBusinessRule.is_active == True
-        ).all()
+        if not latest_report:
+            raise HTTPException(status_code=404, detail="No Excel report found in Reports folder")
         
-        if not rules:
-            return {"message": "No active rules found for this endpoint", "results": []}
+        # Parse the report to get summary data
+        from report_parser import ReportParser
+        parser = ReportParser(latest_report)
+        report_data = parser.generate_email_summary()
         
-        # Call the API endpoint
-        url = endpoint.base_url + endpoint.path
-        headers = json.loads(endpoint.headers) if endpoint.headers else {}
+        # Send the email
+        result = email_service.sendReportEmail(
+            results=report_data,
+            recipients=request.recipients,
+            report_type=request.report_type,
+            attachment_path=latest_report
+        )
         
-        # Handle authentication
-        if endpoint.auth_type == "bearer" and endpoint.auth_token:
-            headers["Authorization"] = f"Bearer {endpoint.auth_token}"
+        return result
         
-        # Make API call
-        if endpoint.method.upper() == "GET":
-            response = requests.get(url, headers=headers, timeout=endpoint.timeout_ms/1000)
-        elif endpoint.method.upper() == "POST":
-            body = json.loads(endpoint.default_request_body) if endpoint.default_request_body else {}
-            response = requests.post(url, json=body, headers=headers, timeout=endpoint.timeout_ms/1000)
-        else:
-            raise HTTPException(status_code=400, detail=f"Unsupported method: {endpoint.method}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to send email report: {str(e)}")
+
+@app.post("/api/azure-devops/generate-report")
+async def generate_ads_automation_report(request: ADSReportRequest):
+    """
+    Generate Azure DevOps Automation Report for a specific user story.
+    Retrieves all bugs linked to the user story and generates a comprehensive HTML report.
+    """
+    try:
+        from ads_report_generator import ADSReportGenerator
         
-        if response.status_code != 200:
-            raise HTTPException(status_code=response.status_code, detail=f"API call failed: {response.text}")
+        # Get bugs from Azure DevOps
+        bugs_result = azure_devops_service.get_bugs_by_user_story(request.user_story_id)
         
-        # Parse response
-        response_data = response.json()
+        if bugs_result.get('status') != 'success':
+            raise HTTPException(status_code=500, detail=bugs_result.get('message', 'Failed to retrieve bugs'))
         
-        # Determine if response is a list or single object
-        records = []
-        wrapper_fields = {}
-        array_key = None
+        bugs = bugs_result.get('bugs', [])
         
-        if isinstance(response_data, list):
-            records = response_data
-        elif isinstance(response_data, dict):
-            # Look for arrays in the response object
-            # Common patterns: "data", "items", "results", or any array property
-            found_array = False
-            for key, value in response_data.items():
-                if isinstance(value, list) and len(value) > 0 and isinstance(value[0], dict):
-                    # Found an array of objects - use this as records
-                    records = value
-                    array_key = key
-                    found_array = True
-                    # Store wrapper-level fields (everything except the array)
-                    wrapper_fields = {k: v for k, v in response_data.items() if k != key}
-                    break
-            
-            # If no array found, treat the whole object as a single record
-            if not found_array:
-                records = [response_data]
-        else:
-            records = [response_data]
+        if not bugs:
+            return {
+                "status": "success",
+                "message": f"No bugs found for user story {request.user_story_id}",
+                "bug_count": 0,
+                "html_report": None
+            }
         
-        # Get schema fields from both wrapper and first record
-        # Include wrapper fields (totalRecords, limit, etc.) and record fields (title, hrsaWideFlag, etc.)
-        schema_fields = []
-        if wrapper_fields:
-            # Add wrapper-level fields
-            for key in wrapper_fields.keys():
-                if not isinstance(wrapper_fields[key], dict):  # Skip nested objects like "links"
-                    schema_fields.append(key)
+        # Generate report
+        report_generator = ADSReportGenerator()
+        processed_data = report_generator.process_bugs(bugs)
         
-        # Add record-level fields
-        if records and len(records) > 0:
-            schema_fields.extend(list(records[0].keys()))
+        # Generate HTML report
+        html_report = report_generator.generate_html_report(
+            processed_data=processed_data,
+            user_story_id=request.user_story_id,
+            test_results=request.test_results if request.include_test_results else None
+        )
         
-        # Run each rule against all records
-        all_results = []
+        # Save report to file
+        reports_dir = Path("Reports/ADS_Reports")
+        reports_dir.mkdir(parents=True, exist_ok=True)
         
-        for rule in rules:
-            # Interpret the rule using AI
-            rule_interpretation = interpret_rule_with_ai(rule.rule_text, schema_fields)
-            
-            # Check if referenced fields exist in schema
-            validation_field = rule_interpretation.get("validation_field")
-            condition_field = rule_interpretation.get("condition_field")
-            
-            field_warnings = []
-            if validation_field and validation_field not in schema_fields:
-                field_warnings.append(f"Warning: Field '{validation_field}' not found in API response schema")
-            if condition_field and condition_field not in schema_fields:
-                field_warnings.append(f"Warning: Field '{condition_field}' not found in API response schema")
-            
-            # Determine if this rule references wrapper-level fields or array-level fields
-            wrapper_field_keys = list(wrapper_fields.keys()) if wrapper_fields else []
-            is_wrapper_rule = (validation_field in wrapper_field_keys) or (condition_field in wrapper_field_keys)
-            
-            if is_wrapper_rule:
-                # Validate wrapper-level fields once (not per record)
-                # Merge wrapper fields with first record for validation context
-                wrapper_record = {**wrapper_fields, **(records[0] if records else {})}
-                validation_result = apply_validation_rule(wrapper_record, rule_interpretation, 0)
-                validation_result["record_number"] = None  # Wrapper validation, not tied to a specific record
-                
-                # Save validation result to database
-                db_result = BusinessRuleValidation(
-                    rule_id=rule.id,
-                    endpoint_id=endpoint_id,
-                    record_number=validation_result["record_number"],
-                    field_name=validation_result["field_name"],
-                    expected_value=validation_result["expected_value"],
-                    actual_value=validation_result["actual_value"],
-                    result=validation_result["result"],
-                    error_message=validation_result["error_message"],
-                    rule_text=rule.rule_text
-                )
-                db.add(db_result)
-                
-                all_results.append({
-                    "rule_id": rule.id,
-                    "rule_name": rule.rule_name,
-                    "rule_text": rule.rule_text,
-                    "record_number": "Wrapper",
-                    "field_name": validation_result["field_name"],
-                    "expected_value": validation_result["expected_value"],
-                    "actual_value": validation_result["actual_value"],
-                    "result": validation_result["result"],
-                    "error_message": validation_result["error_message"],
-                    "warnings": field_warnings
-                })
-            else:
-                # Apply rule to each record in the array
-                for idx, record in enumerate(records, start=1):
-                    # Merge wrapper fields into each record for context
-                    enriched_record = {**wrapper_fields, **record}
-                    validation_result = apply_validation_rule(enriched_record, rule_interpretation, idx)
-                    
-                    # Save validation result to database
-                    db_result = BusinessRuleValidation(
-                        rule_id=rule.id,
-                        endpoint_id=endpoint_id,
-                        record_number=validation_result["record_number"],
-                        field_name=validation_result["field_name"],
-                        expected_value=validation_result["expected_value"],
-                        actual_value=validation_result["actual_value"],
-                        result=validation_result["result"],
-                        error_message=validation_result["error_message"],
-                        rule_text=rule.rule_text
-                    )
-                    db.add(db_result)
-                    
-                    all_results.append({
-                        "rule_id": rule.id,
-                        "rule_name": rule.rule_name,
-                        "rule_text": rule.rule_text,
-                        "record_number": validation_result["record_number"],
-                        "field_name": validation_result["field_name"],
-                        "expected_value": validation_result["expected_value"],
-                        "actual_value": validation_result["actual_value"],
-                        "result": validation_result["result"],
-                        "error_message": validation_result["error_message"],
-                        "warnings": field_warnings
-                    })
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        report_filename = f"ADS_Report_US{request.user_story_id}_{timestamp}.html"
+        report_path = reports_dir / report_filename
         
-        db.commit()
-        
-        # Calculate summary
-        total_validations = len(all_results)
-        passed = sum(1 for r in all_results if r["result"] == "PASS")
-        failed = sum(1 for r in all_results if r["result"] == "FAIL")
+        with open(report_path, 'w', encoding='utf-8') as f:
+            f.write(html_report)
         
         return {
-            "summary": {
-                "total_validations": total_validations,
-                "passed": passed,
-                "failed": failed,
-                "total_records": len(records),
-                "total_rules": len(rules)
-            },
-            "results": all_results,
-            "api_response": response_data
+            "status": "success",
+            "message": f"Report generated successfully for user story {request.user_story_id}",
+            "bug_count": len(bugs),
+            "active_bugs": processed_data['metrics']['active_bugs'],
+            "resolved_bugs": processed_data['metrics']['resolved_bugs'],
+            "report_path": str(report_path),
+            "report_filename": report_filename,
+            "html_report": html_report,
+            "metrics": {
+                "total_bugs": processed_data['metrics']['total_bugs'],
+                "active_bugs": processed_data['metrics']['active_bugs'],
+                "resolved_bugs": processed_data['metrics']['resolved_bugs'],
+                "closed_bugs": processed_data['metrics']['closed_bugs'],
+                "avg_age_active": round(processed_data['metrics']['avg_age_active'], 1),
+                "avg_cycle_time": round(processed_data['metrics']['avg_cycle_time'], 1),
+                "by_category": dict(processed_data['metrics']['by_category'])
+            }
         }
         
     except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=f"Validation failed: {str(e)}")
-    finally:
-        db.close()
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Failed to generate report: {str(e)}")
 
-@app.get("/api/business-rules/validation-history/{endpoint_id}")
-def get_validation_history(endpoint_id: int, db: Session = Depends(get_db)):
-    """Get validation history for an endpoint"""
+@app.get("/api/azure-devops/bugs/{user_story_id}")
+async def get_bugs_for_user_story(user_story_id: int):
+    """Get all bugs linked to a specific user story."""
     try:
-        results = db.query(BusinessRuleValidation).filter(
-            BusinessRuleValidation.endpoint_id == endpoint_id
-        ).order_by(BusinessRuleValidation.execution_date.desc()).limit(100).all()
+        result = azure_devops_service.get_bugs_by_user_story(user_story_id)
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to retrieve bugs: {str(e)}")
+
+@app.post("/api/azure-devops/generate-board-report")
+async def generate_board_report(board_name: str):
+    """Generate enhanced report for entire board by aggregating all user stories."""
+    try:
+        from enhanced_ads_report_generator import EnhancedADSReportGenerator
         
-        return results
-    finally:
-        db.close()
+        ads_service = AzureDevOpsService()
+        
+        # Get all user stories from the board
+        user_stories_result = ads_service.get_board_user_stories(board_name)
+        
+        if user_stories_result.get('status') != 'success':
+            raise HTTPException(status_code=404, detail=user_stories_result.get('message', 'Failed to get user stories'))
+        
+        user_stories = user_stories_result.get('user_stories', [])
+        
+        if not user_stories:
+            raise HTTPException(status_code=404, detail=f"No user stories found for board: {board_name}")
+        
+        # Aggregate all bugs from all user stories
+        all_bugs = []
+        for story in user_stories:
+            bugs_result = ads_service.get_bugs_by_user_story(story['id'])
+            if bugs_result.get('status') == 'success' and bugs_result.get('bugs'):
+                all_bugs.extend(bugs_result['bugs'])
+        
+        if not all_bugs:
+            raise HTTPException(status_code=404, detail=f"No bugs found for board: {board_name}")
+        
+        # Generate enhanced report
+        report_generator = EnhancedADSReportGenerator()
+        processed_data = report_generator.process_bugs(all_bugs)
+        
+        # Generate HTML report without user story details
+        html_report = report_generator.generate_html_report(
+            processed_data=processed_data,
+            user_story=None,
+            test_results=None,
+            show_user_story_details=False
+        )
+        
+        # Save report to file
+        reports_dir = Path("Reports/ADS_Reports")
+        reports_dir.mkdir(parents=True, exist_ok=True)
+        
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        report_filename = f"Board_Report_{board_name.replace(' ', '_')}_{timestamp}.html"
+        report_path = reports_dir / report_filename
+        
+        with open(report_path, 'w', encoding='utf-8') as f:
+            f.write(html_report)
+        
+        return {
+            "status": "success",
+            "message": f"Board report generated successfully for {board_name}",
+            "report_filename": report_filename,
+            "report_path": str(report_path),
+            "html_report": html_report,
+            "total_user_stories": len(user_stories),
+            "total_bugs": processed_data['metrics']['total_bugs'],
+            "metrics": processed_data['metrics']
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to generate board report: {str(e)}")
+
+@app.post("/api/azure-devops/create-bugs-batch")
+async def create_bugs_batch(request: dict):
+    """Create multiple bugs in Azure DevOps linked to a User Story."""
+    try:
+        user_story_id = request.get('user_story_id')
+        bugs = request.get('bugs', [])
+        
+        if not user_story_id:
+            raise HTTPException(status_code=400, detail="User Story ID is required")
+        
+        if not bugs:
+            raise HTTPException(status_code=400, detail="No bugs provided")
+        
+        ads_service = AzureDevOpsService()
+        created_bugs = []
+        failed_bugs = []
+        
+        for bug_data in bugs:
+            try:
+                print(f"[DEBUG] Creating bug: {bug_data.get('title')}")
+                
+                # Map severity to Azure DevOps format
+                severity_map = {
+                    'Critical': '1 - Critical',
+                    'High': '2 - High',
+                    'Medium': '3 - Medium',
+                    'Low': '4 - Low'
+                }
+                severity = bug_data.get('severity', 'Medium')
+                mapped_severity = severity_map.get(severity, '3 - Medium')
+                
+                # Parse request and response payloads
+                try:
+                    request_payload = json.loads(bug_data.get('requestPayload', '{}')) if isinstance(bug_data.get('requestPayload'), str) else bug_data.get('requestPayload', {})
+                except:
+                    request_payload = {}
+                
+                try:
+                    response_payload = json.loads(bug_data.get('responsePayload', '{}')) if isinstance(bug_data.get('responsePayload'), str) else bug_data.get('responsePayload', {})
+                except:
+                    response_payload = {}
+                
+                # Prepare comprehensive failure data for bug creation
+                failure_data = {
+                    'title': bug_data.get('title', 'Test Failure'),
+                    'test_name': bug_data.get('title', 'Test Failure'),
+                    'scenario_name': bug_data.get('title', 'Test Failure'),
+                    'field_name': bug_data.get('field', 'N/A'),
+                    'endpoint': f"Endpoint ID: {bug_data.get('endpointId', 'N/A')}",
+                    'base_url': os.getenv('AZURE_DEVOPS_BASE_URL', ''),
+                    'environment': bug_data.get('environment', 'Test'),
+                    'timestamp': datetime.now().isoformat(),
+                    'execution_date': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                    'severity': mapped_severity,
+                    'priority': bug_data.get('priority', 2),
+                    'error_message': bug_data.get('description', ''),
+                    'expected': bug_data.get('expectedResult', 'N/A'),
+                    'actual': bug_data.get('actualResult', 'N/A'),
+                    'expected_result': bug_data.get('expectedResult', 'N/A'),
+                    'actual_result': bug_data.get('actualResult', 'N/A'),
+                    'expected_results': bug_data.get('expectedResult', 'N/A'),
+                    'actual_results': bug_data.get('actualResult', 'N/A'),
+                    'request_payload': request_payload,
+                    'response_payload': response_payload,
+                    'request_body': request_payload,
+                    'response_body': response_payload,
+                    'steps_to_reproduce': bug_data.get('reproSteps', ''),
+                    'test_severity': bug_data.get('severity', 'Medium'),
+                    'api_name': f"Scenario {bug_data.get('scenarioId', 'N/A')}",
+                    'failure_timestamp': datetime.now().isoformat()
+                }
+                
+                print(f"[DEBUG] Failure data prepared: {failure_data.get('title')}")
+                
+                # Create bug in Azure DevOps with O&M classification
+                result = ads_service.create_bug_from_failure(
+                    failure_data=failure_data,
+                    work_item_type="Bug",
+                    tags=bug_data.get('tags', ['Automated Test']),
+                    assigned_to=bug_data.get('assignedTo', None) if bug_data.get('assignedTo') else None,
+                    classification="O&M"  # Set classification to O&M
+                )
+                
+                print(f"[DEBUG] Bug creation result: {result}")
+                
+                if result.get('status') == 'success':
+                    bug_id = result.get('work_item_id')  # Changed from bug_id to work_item_id
+                    print(f"[DEBUG] Bug created successfully with ID: {bug_id}")
+                    
+                    # Link bug to user story
+                    link_result = ads_service.link_bug_to_user_story(bug_id, user_story_id)
+                    print(f"[DEBUG] Link result: {link_result}")
+                    
+                    created_bugs.append({
+                        'bug_id': bug_id,
+                        'title': bug_data.get('title'),
+                        'url': result.get('work_item_url'),
+                        'linked': link_result.get('status') == 'success'
+                    })
+                else:
+                    print(f"[DEBUG] Bug creation failed: {result.get('message')}")
+                    failed_bugs.append({
+                        'title': bug_data.get('title'),
+                        'error': result.get('message', 'Unknown error')
+                    })
+                    
+            except Exception as e:
+                print(f"[DEBUG] Exception creating bug: {str(e)}")
+                failed_bugs.append({
+                    'title': bug_data.get('title', 'Unknown'),
+                    'error': str(e)
+                })
+        
+        return {
+            "status": "success",
+            "created_count": len(created_bugs),
+            "failed_count": len(failed_bugs),
+            "created_bugs": created_bugs,
+            "failed_bugs": failed_bugs,
+            "user_story_id": user_story_id
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to create bugs: {str(e)}")
+
+@app.post("/api/azure-devops/generate-enhanced-report-multi")
+async def generate_enhanced_ads_report_multi(request: dict):
+    """
+    Generate Enhanced Azure DevOps Automation Report for multiple user stories.
+    Accepts comma-separated user story IDs and combines bugs from all stories.
+    """
+    try:
+        from enhanced_ads_report_generator import EnhancedADSReportGenerator
+        
+        user_story_ids = request.get('user_story_ids', [])
+        if not user_story_ids:
+            raise HTTPException(status_code=400, detail="User Story IDs are required")
+        
+        all_bugs = []
+        user_stories = []
+        
+        # Fetch bugs from all user stories
+        print(f"[DEBUG] Fetching bugs from {len(user_story_ids)} user stories: {user_story_ids}")
+        for user_story_id in user_story_ids:
+            # Get User Story details
+            user_story_result = azure_devops_service.get_user_story_details(user_story_id)
+            if user_story_result.get('status') == 'success':
+                user_stories.append(user_story_result.get('user_story'))
+            
+            # Get bugs from Azure DevOps
+            bugs_result = azure_devops_service.get_bugs_by_user_story(user_story_id)
+            if bugs_result.get('status') == 'success':
+                bugs = bugs_result.get('bugs', [])
+                print(f"[DEBUG] User story {user_story_id}: Found {len(bugs)} bugs")
+                all_bugs.extend(bugs)
+            else:
+                print(f"[DEBUG] User story {user_story_id}: Error - {bugs_result.get('message')}")
+        
+        if not all_bugs:
+            return {
+                "status": "success",
+                "message": f"No bugs found for user stories {user_story_ids}",
+                "bug_count": 0,
+                "html_report": None,
+                "user_stories": user_stories
+            }
+        
+        # Generate enhanced report with combined bugs
+        print(f"[DEBUG] Generating report for {len(all_bugs)} bugs from {len(user_story_ids)} user stories")
+        report_generator = EnhancedADSReportGenerator()
+        processed_data = report_generator.process_bugs(all_bugs)
+        print(f"[DEBUG] Processed data metrics: {processed_data.get('metrics', {})}")
+        
+        # Use first user story for report header (or None if no stories found)
+        primary_user_story = user_stories[0] if user_stories else None
+        print(f"[DEBUG] Primary user story: {primary_user_story.get('id') if primary_user_story else 'None'}")
+        
+        # Generate HTML report
+        try:
+            html_report = report_generator.generate_html_report(
+                processed_data=processed_data,
+                user_story=primary_user_story,
+                test_results=request.get('test_results') if request.get('include_test_results') else None,
+                show_user_story_details=request.get('show_user_story_details', False)
+            )
+            print(f"[DEBUG] HTML report generated successfully, length: {len(html_report)}")
+        except Exception as e:
+            print(f"[ERROR] Failed to generate HTML report: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            raise
+        
+        # Save report
+        report_dir = Path("reports")
+        report_dir.mkdir(exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        ids_str = "_".join(map(str, user_story_ids[:3]))  # Use first 3 IDs in filename
+        report_filename = f"ADS_Report_UserStories_{ids_str}_{timestamp}.html"
+        report_path = report_dir / report_filename
+        
+        with open(report_path, 'w', encoding='utf-8') as f:
+            f.write(html_report)
+        
+        return {
+            "status": "success",
+            "message": f"Report generated successfully for {len(user_story_ids)} user stories with {len(all_bugs)} total bugs",
+            "bug_count": len(all_bugs),
+            "user_story_count": len(user_stories),
+            "report_filename": report_filename,
+            "report_path": str(report_path),
+            "html_report": html_report,
+            "metrics": processed_data['metrics']
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to generate multi-story report: {str(e)}")
+
+@app.post("/api/azure-devops/generate-enhanced-report")
+async def generate_enhanced_ads_report(request: EnhancedADSReportRequest):
+    """
+    Generate Enhanced Azure DevOps Automation Report with advanced visualizations.
+    Supports User Story details, Board queries, and modern styling.
+    """
+    try:
+        from enhanced_ads_report_generator import EnhancedADSReportGenerator
+        
+        # Get User Story details
+        if not request.user_story_id:
+            raise HTTPException(status_code=400, detail="User Story ID is required")
+        
+        user_story_result = azure_devops_service.get_user_story_details(request.user_story_id)
+        
+        if user_story_result.get('status') != 'success':
+            raise HTTPException(status_code=500, detail=user_story_result.get('message', 'Failed to retrieve user story'))
+        
+        user_story = user_story_result.get('user_story')
+        
+        # Get bugs from Azure DevOps
+        bugs_result = azure_devops_service.get_bugs_by_user_story(request.user_story_id)
+        
+        if bugs_result.get('status') != 'success':
+            raise HTTPException(status_code=500, detail=bugs_result.get('message', 'Failed to retrieve bugs'))
+        
+        bugs = bugs_result.get('bugs', [])
+        
+        if not bugs:
+            return {
+                "status": "success",
+                "message": f"No bugs found for user story {request.user_story_id}",
+                "bug_count": 0,
+                "html_report": None,
+                "user_story": user_story
+            }
+        
+        # Generate enhanced report
+        report_generator = EnhancedADSReportGenerator()
+        processed_data = report_generator.process_bugs(bugs)
+        
+        # Generate HTML report with User Story details
+        html_report = report_generator.generate_html_report(
+            processed_data=processed_data,
+            user_story=user_story,
+            test_results=request.test_results if request.include_test_results else None,
+            show_user_story_details=request.show_user_story_details
+        )
+        
+        # Save report to file
+        reports_dir = Path("Reports/ADS_Reports")
+        reports_dir.mkdir(parents=True, exist_ok=True)
+        
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        report_filename = f"Enhanced_ADS_Report_US{request.user_story_id}_{timestamp}.html"
+        report_path = reports_dir / report_filename
+        
+        with open(report_path, 'w', encoding='utf-8') as f:
+            f.write(html_report)
+        
+        return {
+            "status": "success",
+            "message": f"Enhanced report generated successfully for user story {request.user_story_id}",
+            "bug_count": len(bugs),
+            "active_bugs": processed_data['metrics']['active_bugs'],
+            "resolved_bugs": processed_data['metrics']['resolved_bugs'],
+            "report_path": str(report_path),
+            "report_filename": report_filename,
+            "html_report": html_report,
+            "user_story": {
+                "id": user_story['id'],
+                "title": user_story['title'],
+                "state": user_story['state'],
+                "story_points": user_story.get('story_points', 0),
+                "priority": user_story.get('priority', 3),
+                "business_value": user_story.get('business_value', 0),
+                "assigned_to": user_story.get('assigned_to', 'Unassigned')
+            },
+            "metrics": {
+                "total_bugs": processed_data['metrics']['total_bugs'],
+                "active_bugs": processed_data['metrics']['active_bugs'],
+                "resolved_bugs": processed_data['metrics']['resolved_bugs'],
+                "closed_bugs": processed_data['metrics']['closed_bugs'],
+                "avg_age_active": round(processed_data['metrics']['avg_age_active'], 1),
+                "avg_cycle_time": round(processed_data['metrics']['avg_cycle_time'], 1),
+                "by_category": dict(processed_data['metrics']['by_category'])
+            }
+        }
+        
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Failed to generate enhanced report: {str(e)}")
+
+@app.get("/api/azure-devops/board/user-stories")
+async def get_board_user_stories(iteration_path: Optional[str] = None, board_name: Optional[str] = None):
+    """Get user stories from Azure DevOps Board."""
+    try:
+        result = azure_devops_service.get_board_user_stories(board_name=board_name, iteration_path=iteration_path)
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to retrieve board user stories: {str(e)}")
+
+@app.get("/api/azure-devops/user-story/{user_story_id}")
+async def get_user_story_details_endpoint(user_story_id: int):
+    """Get detailed information about a specific user story."""
+    try:
+        result = azure_devops_service.get_user_story_details(user_story_id)
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to retrieve user story details: {str(e)}")
 
 if __name__ == "__main__":
     import uvicorn
