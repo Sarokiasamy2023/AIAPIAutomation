@@ -28,7 +28,7 @@ app = FastAPI(title="GS API Test Platform")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5000"],
+    allow_origins=["*"],  # Allow all origins for network access
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
