@@ -1,7 +1,6 @@
 import { useState, useEffect } from 'react'
 import { Mail, Clock, Send, Plus, Trash2, Edit2, CheckCircle, XCircle, AlertCircle } from 'lucide-react'
-
-const API_BASE = 'http://localhost:8000'
+import { API_BASE } from './config'
 
 function EmailReportsTab() {
   const [schedules, setSchedules] = useState([])

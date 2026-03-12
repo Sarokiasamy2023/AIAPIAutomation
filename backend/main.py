@@ -28,7 +28,12 @@ app = FastAPI(title="GS API Test Platform")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5000"],
+    allow_origins=[
+        "http://localhost:5000",
+        "http://ehb-omsbxas-t01.ehbsbx.work:5000",
+        "http://ehb-omsbxas-t01.ehbsbx.work",
+        "*"  # Allow all origins for development/testing
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -4407,11 +4412,41 @@ async def create_tasks_from_validation_failures(request: CreateTasksRequest):
         db.close()
 
 def get_latest_report_file():
-    """Get the most recent report file from the Reports directory."""
+    """Get the most recent test execution report file from the Reports directory."""
+    import openpyxl
+    
     report_files = list(REPORTS_DIR.glob("*.xlsx"))
     if not report_files:
         return None
-    latest_file = max(report_files, key=lambda p: p.stat().st_mtime)
+    
+    # Filter for valid test execution reports (exclude ADS reports)
+    valid_reports = []
+    for file_path in report_files:
+        try:
+            # Quick check: ADS reports have "ADS_Report" in filename
+            if "ADS_Report" in file_path.name:
+                continue
+            
+            # Verify it's a test execution report by checking for Overall Summary sheet
+            wb = openpyxl.load_workbook(file_path, read_only=True, data_only=True)
+            sheet_names = wb.sheetnames
+            wb.close()
+            
+            # Valid test execution reports should have Overall Summary or multiple endpoint sheets
+            if 'Overall Summary' in sheet_names or len(sheet_names) > 1:
+                valid_reports.append(file_path)
+        except Exception as e:
+            print(f"Error checking report file {file_path.name}: {str(e)}")
+            continue
+    
+    if not valid_reports:
+        # Fallback to any xlsx file if no valid reports found
+        print("Warning: No valid test execution reports found, using latest xlsx file")
+        latest_file = max(report_files, key=lambda p: p.stat().st_mtime)
+        return str(latest_file)
+    
+    # Return the most recent valid report
+    latest_file = max(valid_reports, key=lambda p: p.stat().st_mtime)
     return str(latest_file)
 
 @app.get("/api/business-rules/endpoint/{endpoint_id}", response_model=List[CustomBusinessRuleResponse])

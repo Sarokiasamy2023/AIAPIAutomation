@@ -5,8 +5,7 @@ import EndpointsTab from './EndpointsTab'
 import Dashboard from './Dashboard'
 import EmailReportsTab from './EmailReportsTab'
 import ADSReporterTab from './ADSReporterTab'
-
-const API_BASE = 'http://localhost:8000'
+import { API_BASE } from './config'
 
 function App() {
   const [activeTab, setActiveTab] = useState('upload')

@@ -94,10 +94,30 @@ class EmailService:
     def _build_email_body(self, results: Dict, recipients: List[str]) -> str:
         """Generate a clean, professional HTML email body."""
         
-        success_count = results.get('success_count', 0)
-        failure_count = results.get('failure_count', 0)
-        total_count = results.get('total_count', 0)
-        success_rate = results.get('success_rate', 0)
+        # Detect report type
+        report_type = results.get('overall_summary', {}).get('report_type', 'test_execution')
+        
+        # Extract metrics based on report type
+        if report_type == 'validation':
+            # Validation report metrics
+            overall = results.get('overall_summary', {})
+            success_count = overall.get('total_passed', 0)  # Fields Correct
+            failure_count = overall.get('total_failed', 0)  # Fields Incorrect
+            total_count = overall.get('total_fields', 0)  # Total Fields
+            total_announcements = overall.get('total_executions', 0)  # Announcements
+            success_rate = overall.get('success_rate', 0)
+            report_label = "Field Validation Report"
+            test_label = "Fields Validated"
+        else:
+            # Test execution report metrics
+            success_count = results.get('success_count', 0)
+            failure_count = results.get('failure_count', 0)
+            total_count = results.get('total_count', 0)
+            total_announcements = 0
+            success_rate = results.get('success_rate', 0)
+            report_label = "Test Execution Report"
+            test_label = "Tests Executed"
+        
         metrics = results.get('metrics', {})
         issues = results.get('issues', [])
         notes = results.get('notes', '')
@@ -249,17 +269,27 @@ class EmailService:
                     <table style="width: 100%; margin: 20px 0;">
                         <tr>
                             <td style="width: 50%; vertical-align: top;">
-                                <div class="metrics">
+                                <div class="metrics">"""
+        
+        # Add announcements row for validation reports
+        if report_type == 'validation':
+            html_body += f"""
                                     <div class="metric-row">
-                                        <div class="metric-label">Total Tests Executed</div>
+                                        <div class="metric-label">📋 Total Announcements</div>
+                                        <div class="metric-value">{total_announcements}</div>
+                                    </div>"""
+        
+        html_body += f"""
+                                    <div class="metric-row">
+                                        <div class="metric-label">{test_label}</div>
                                         <div class="metric-value">{total_count}</div>
                                     </div>
                                     <div class="metric-row">
-                                        <div class="metric-label">✅ Passed</div>
+                                        <div class="metric-label">✅ Correct/Passed</div>
                                         <div class="metric-value" style="color: #28a745;">{success_count}</div>
                                     </div>
                                     <div class="metric-row">
-                                        <div class="metric-label">❌ Failed</div>
+                                        <div class="metric-label">❌ Incorrect/Failed</div>
                                         <div class="metric-value" style="color: #dc3545;">{failure_count}</div>
                                     </div>
                                     <div class="metric-row">

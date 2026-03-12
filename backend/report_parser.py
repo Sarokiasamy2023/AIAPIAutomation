@@ -47,6 +47,12 @@ class ReportParser:
     def _parse_overall_summary(self, excel_file) -> Dict:
         """Parse the Overall Summary sheet."""
         try:
+            # Check if 'Overall Summary' sheet exists
+            if 'Overall Summary' not in excel_file.sheet_names:
+                print(f"Warning: 'Overall Summary' sheet not found. Available sheets: {excel_file.sheet_names}")
+                # Try to calculate summary from other sheets
+                return self._calculate_summary_from_sheets(excel_file)
+            
             df = pd.read_excel(excel_file, sheet_name='Overall Summary')
             
             # Extract metrics from the summary sheet
@@ -55,7 +61,8 @@ class ReportParser:
                 "total_passed": 0,
                 "total_failed": 0,
                 "success_rate": 0.0,
-                "status_breakdown": []
+                "status_breakdown": [],
+                "report_type": "test_execution"  # Default type
             }
             
             # Try to find metrics in the dataframe
@@ -63,6 +70,7 @@ class ReportParser:
                 if pd.notna(row.iloc[0]):
                     metric_name = str(row.iloc[0]).strip()
                     
+                    # Test Execution Report metrics
                     if "Total Executions" in metric_name or "Total Tests" in metric_name:
                         summary["total_executions"] = int(row.iloc[1]) if pd.notna(row.iloc[1]) else 0
                     elif "Total Passed" in metric_name or "Passed" in metric_name:
@@ -71,15 +79,78 @@ class ReportParser:
                         summary["total_failed"] = int(row.iloc[1]) if pd.notna(row.iloc[1]) else 0
                     elif "Success Rate" in metric_name:
                         summary["success_rate"] = float(row.iloc[1]) if pd.notna(row.iloc[1]) else 0.0
+                    
+                    # Validation Report metrics
+                    elif "Total Announcements Received" in metric_name:
+                        summary["report_type"] = "validation"
+                        summary["total_executions"] = int(row.iloc[1]) if pd.notna(row.iloc[1]) else 0
+                    elif "Fields Read" in metric_name:
+                        summary["total_fields"] = int(row.iloc[1]) if pd.notna(row.iloc[1]) else 0
+                    elif "Fields Correct" in metric_name:
+                        summary["total_passed"] = int(row.iloc[1]) if pd.notna(row.iloc[1]) else 0
+                    elif "Fields Incorrect" in metric_name:
+                        summary["total_failed"] = int(row.iloc[1]) if pd.notna(row.iloc[1]) else 0
+                    elif "% Correct" in metric_name:
+                        val = str(row.iloc[1]).replace('%', '').strip()
+                        summary["success_rate"] = float(val) if val else 0.0
             
             # Calculate success rate if not found
-            if summary["success_rate"] == 0 and summary["total_executions"] > 0:
-                summary["success_rate"] = round((summary["total_passed"] / summary["total_executions"]) * 100, 2)
+            if summary["success_rate"] == 0:
+                if summary["report_type"] == "validation" and summary.get("total_fields", 0) > 0:
+                    summary["success_rate"] = round((summary["total_passed"] / summary["total_fields"]) * 100, 2)
+                elif summary["total_executions"] > 0:
+                    summary["success_rate"] = round((summary["total_passed"] / summary["total_executions"]) * 100, 2)
             
             return summary
             
         except Exception as e:
             print(f"Error parsing overall summary: {str(e)}")
+            return {
+                "total_executions": 0,
+                "total_passed": 0,
+                "total_failed": 0,
+                "success_rate": 0.0,
+                "status_breakdown": [],
+                "report_type": "unknown"
+            }
+    
+    def _calculate_summary_from_sheets(self, excel_file) -> Dict:
+        """Calculate summary metrics from individual endpoint sheets when Overall Summary is missing."""
+        try:
+            summary = {
+                "total_executions": 0,
+                "total_passed": 0,
+                "total_failed": 0,
+                "success_rate": 0.0,
+                "status_breakdown": []
+            }
+            
+            # Iterate through all sheets and aggregate data
+            for sheet_name in excel_file.sheet_names:
+                try:
+                    df = pd.read_excel(excel_file, sheet_name=sheet_name)
+                    
+                    # Look for status columns
+                    if 'Status' in df.columns or 'status' in df.columns:
+                        status_col = 'Status' if 'Status' in df.columns else 'status'
+                        passed = len(df[df[status_col].str.lower() == 'pass'])
+                        failed = len(df[df[status_col].str.lower() == 'fail'])
+                        
+                        summary["total_executions"] += (passed + failed)
+                        summary["total_passed"] += passed
+                        summary["total_failed"] += failed
+                except Exception as e:
+                    print(f"Error parsing sheet {sheet_name}: {str(e)}")
+                    continue
+            
+            # Calculate success rate
+            if summary["total_executions"] > 0:
+                summary["success_rate"] = round((summary["total_passed"] / summary["total_executions"]) * 100, 2)
+            
+            return summary
+            
+        except Exception as e:
+            print(f"Error calculating summary from sheets: {str(e)}")
             return {
                 "total_executions": 0,
                 "total_passed": 0,
