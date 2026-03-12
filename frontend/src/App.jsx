@@ -5,14 +5,7 @@ import EndpointsTab from './EndpointsTab'
 import Dashboard from './Dashboard'
 import EmailReportsTab from './EmailReportsTab'
 import ADSReporterTab from './ADSReporterTab'
-
-// Dynamically determine API base URL based on current host
-// Frontend runs on port 5000, backend runs on port 8000
-// For development: uses localhost
-// For network/VM deployment: uses the VM's hostname (e.g., ehb-omsbxas-t01.ehbsbx.work)
-const API_BASE = window.location.hostname === 'localhost' 
-  ? 'http://localhost:8000' 
-  : `http://${window.location.hostname}:8000`
+import API_BASE from './config'
 
 function App() {
   const [activeTab, setActiveTab] = useState('upload')
