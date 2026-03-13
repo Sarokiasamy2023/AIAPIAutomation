@@ -75,7 +75,7 @@ echo   Hostname: %HOSTNAME%
 echo.
 
 echo [4/5] Starting Backend Server on port 8000
-start "GS API Backend - DO NOT CLOSE" powershell -NoExit -Command "cd backend; .\venv\Scripts\activate; uvicorn main:app --host 0.0.0.0 --port 8000"
+start "GS API Backend - DO NOT CLOSE" powershell -NoExit -Command "cd backend; python -m uvicorn main:app --host 0.0.0.0 --port 8000"
 
 timeout /t 4 /nobreak >nul
 
