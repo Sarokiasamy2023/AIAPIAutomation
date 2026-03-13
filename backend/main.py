@@ -541,6 +541,132 @@ Return JSON: {{"type":"...","confidence":0-100}}"""
     
     return {"type": "text", "confidence": 0}
 
+def interpret_rule_with_ai(rule_text: str, schema_fields: list) -> dict:
+    """Interpret a business rule using AI to extract validation logic."""
+    try:
+        client = AzureOpenAI(
+            api_key=os.getenv("AZURE_OPENAI_API_KEY"),
+            api_version=os.getenv("AZURE_OPENAI_API_VERSION", "2024-02-15-preview"),
+            azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT")
+        )
+        deployment_name = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME", "gpt-4")
+        
+        prompt = f"""Parse this business rule and extract validation logic.
+Rule: "{rule_text}"
+Available fields: {schema_fields}
+
+Return JSON with:
+- validation_field: field to validate
+- validation_value: expected value
+- condition_field: field for condition (if conditional rule)
+- condition_value: value for condition
+- operator: comparison operator (equals, not_equals, contains, greater_than, less_than, exists, not_exists)
+
+Example: "hrsaWideFlag should be true" returns:
+{{"validation_field": "hrsaWideFlag", "validation_value": true, "operator": "equals"}}"""
+
+        response = client.chat.completions.create(
+            model=deployment_name,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=200,
+            temperature=0.3
+        )
+        
+        response_text = response.choices[0].message.content.strip()
+        start_idx = response_text.find('{')
+        end_idx = response_text.rfind('}') + 1
+        
+        if start_idx != -1 and end_idx > start_idx:
+            json_str = response_text[start_idx:end_idx]
+            result = json.loads(json_str)
+            return result
+            
+    except Exception as e:
+        print(f"Error interpreting rule with AI: {e}")
+    
+    # Fallback: simple parsing
+    return {
+        "validation_field": "unknown",
+        "validation_value": None,
+        "operator": "equals",
+        "condition_field": None,
+        "condition_value": None
+    }
+
+def apply_validation_rule(record: dict, rule_interpretation: dict, record_number: int) -> dict:
+    """Apply validation rule to a record and return result."""
+    validation_field = rule_interpretation.get("validation_field")
+    validation_value = rule_interpretation.get("validation_value")
+    operator = rule_interpretation.get("operator", "equals")
+    condition_field = rule_interpretation.get("condition_field")
+    condition_value = rule_interpretation.get("condition_value")
+    
+    # Check if condition applies (if conditional rule)
+    if condition_field and condition_value is not None:
+        actual_condition = record.get(condition_field)
+        if actual_condition != condition_value:
+            return {
+                "record_number": record_number,
+                "result": "PASS",
+                "field_name": validation_field,
+                "expected_value": None,
+                "actual_value": None,
+                "error_message": "Condition not met, rule does not apply"
+            }
+    
+    # Get actual value
+    actual_value = record.get(validation_field)
+    
+    # Perform validation based on operator
+    result = "FAIL"
+    error_message = None
+    
+    if operator == "equals":
+        result = "PASS" if actual_value == validation_value else "FAIL"
+        if result == "FAIL":
+            error_message = f"Expected {validation_value}, got {actual_value}"
+    elif operator == "not_equals":
+        result = "PASS" if actual_value != validation_value else "FAIL"
+        if result == "FAIL":
+            error_message = f"Should not equal {validation_value}"
+    elif operator == "contains":
+        result = "PASS" if validation_value in str(actual_value) else "FAIL"
+        if result == "FAIL":
+            error_message = f"Expected to contain {validation_value}"
+    elif operator == "greater_than":
+        try:
+            result = "PASS" if float(actual_value) > float(validation_value) else "FAIL"
+            if result == "FAIL":
+                error_message = f"Expected > {validation_value}, got {actual_value}"
+        except (ValueError, TypeError):
+            result = "FAIL"
+            error_message = f"Cannot compare values"
+    elif operator == "less_than":
+        try:
+            result = "PASS" if float(actual_value) < float(validation_value) else "FAIL"
+            if result == "FAIL":
+                error_message = f"Expected < {validation_value}, got {actual_value}"
+        except (ValueError, TypeError):
+            result = "FAIL"
+            error_message = f"Cannot compare values"
+    elif operator == "exists":
+        result = "PASS" if validation_field in record else "FAIL"
+        if result == "FAIL":
+            error_message = f"Field {validation_field} does not exist"
+    elif operator == "not_exists":
+        result = "PASS" if validation_field not in record else "FAIL"
+        if result == "FAIL":
+            error_message = f"Field {validation_field} should not exist"
+    
+    return {
+        "record_number": record_number,
+        "result": result,
+        "field_name": validation_field,
+        "expected_value": str(validation_value) if validation_value is not None else None,
+        "actual_value": str(actual_value) if actual_value is not None else None,
+        "error_message": error_message
+    }
+
 async def test_endpoint_and_get_response(endpoint_url: str, endpoint_obj=None):
     """Test the selected endpoint and return its response for AI analysis."""
     try:
